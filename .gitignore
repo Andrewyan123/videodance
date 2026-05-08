@@ -1,0 +1,16 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# project artifacts
+video_pipeline.db
+/tmp/video1.0_stitch/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
