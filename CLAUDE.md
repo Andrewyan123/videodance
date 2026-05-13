@@ -2,6 +2,8 @@
 
 LangGraph-based 文生视频流水线: 用户 prompt → 多 shot 并行生成 → ffmpeg 拼接成片。
 
+**📋 完整架构、流派 profile、扩展点、分阶段路线图见 [design/architecture.md](design/architecture.md)。本文档只列快速入门要点。**
+
 ## Architecture
 
 ```
@@ -20,13 +22,36 @@ State 用 LangGraph reducers 累积(`shots` 用 dict-merge,`total_cost_usd` 用 
 ## Project Structure
 
 ```
-video_ppl.py        # 图定义 + 节点 (orchestration only)
+video_ppl.py        # 图定义 + 节点 (orchestration only, 后续平移到 orchestration/)
+server.py           # FastAPI: POST /api/runs + SSE /api/runs/{tid}/events + 静态前端
+frontend/           # 单页 vanilla HTML/CSS/JS, 不需 build step
+  index.html        # 表单 + 进度条 + 视频播放
+  app.js            # EventSource 消费 SSE, 渲染分阶段进度
+  style.css
+
+design/             # 设计文档 (source of truth)
+  architecture.md   # 整体架构 / Profile / 路线图
+  full.md           # 行业调研原文
+
+profiles/           # 流派 Profile: short_drama / anime / cinema / commercial
+  base.py           # Profile dataclass
+  short_drama.py / anime.py / cinema.py / commercial.py
+  registry.py       # get_profile(id) → Profile
+
+# === 以下为 Phase 1-6 模块骨架 (当前仅 __init__.py + README, 未实装) ===
+assets/             # Phase 1: 角色 / 场景 / 产品资产库 (SQLite + 文件系统)
+storyboard/         # Phase 2: shot DSL Pydantic schema + planner
+critic/             # Phase 4: 多维度评分 + 重试升级
+audio/              # Phase 5: TTS + Wan2.2-Animate 口型同步
+post/               # Phase 6: ffmpeg / RIFE / 字幕 / overlay
+orchestration/      # video_ppl.py 后续平移到这里
+
 providers/          # 模型 backends, 一类 vendor 一个类
   base.py           # Protocol + Result dataclass (LLM/Image/Video)
   _dashscope.py     # 共享 async submit-and-poll
   llm.py            # AnthropicCompatClient, OpenAICompatClient
   image.py          # DashScopeT2I, OpenAIImageClient(stub for gpt-image-2)
-  video.py          # DashScopeI2V, SeedDanceClient(stub)
+  video.py          # DashScopeI2V (已接), SeedDanceClient + JiMengClient (stub, 等 VOLC AK)
   __init__.py       # build_*_provider() 工厂, 读 env 选实现
 prompts/            # 提示词模板
   planner.py        # PLANNER_SYSTEM + build_planner_user()
@@ -68,6 +93,18 @@ uv run python video_ppl.py               # __main__ 默认 dry_run=True
 真实跑:在 `__main__` 改 `dry_run=False`,或调 `run_pipeline(..., dry_run=False)`。
 
 `.env` 必填:`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`(指向 dashscope compat-mode)、`DASHSCOPE_API_KEY`。可选项见 `.env.example` 注释行。
+
+### Web UI
+
+```bash
+uv run uvicorn server:app --host 127.0.0.1 --port 8000
+# 浏览器打开 http://127.0.0.1:8000
+```
+
+- `POST /api/runs` 启动一次 pipeline,返回 `{thread_id}`
+- `GET /api/runs/{tid}/events` SSE 流,每条 `data: {...}` 事件:`started` / `plan_done` / `character_sheets_done` / `shot_progress` / `stitch_done` / `completed` / `error` / `done`
+- `GET /api/video?path=/tmp/...` 服务本地 stitch 产物(白名单限制在 `STITCH_OUT_DIR` 内,防 path traversal)
+- run 状态在内存,**进程重启即丢**;长任务跑到一半重启会孤儿。SQLite checkpoint 还在,但 SSE 流断了不会自动 resume。
 
 ## 当前未实现 / TODO
 

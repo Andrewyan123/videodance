@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Video Pipeline</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Video Pipeline</h1>
+    <span class="hint">LangGraph + DashScope</span>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>1. 输入</h2>
+      <form id="run-form">
+        <label>
+          视频描述
+          <textarea id="prompt" rows="4" required
+            placeholder="例: A young woman with red hair walks through a misty forest at dawn..."></textarea>
+        </label>
+        <div class="row">
+          <label class="grow">
+            目标时长 (秒)
+            <input id="duration" type="number" min="5" max="60" step="1" value="15" />
+          </label>
+          <label class="check">
+            <input id="dry-run" type="checkbox" />
+            <span>dry run (mock 不烧钱)</span>
+          </label>
+        </div>
+        <button id="submit-btn" type="submit">Start</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>2. 进度</h2>
+      <div id="status-bar" class="status">未启动</div>
+      <ol id="phases" class="phases">
+        <li data-phase="plan"><span class="dot"></span>Planner <span class="phase-detail"></span></li>
+        <li data-phase="character_sheets"><span class="dot"></span>Character sheets <span class="phase-detail"></span></li>
+        <li data-phase="shots"><span class="dot"></span>Shots <span class="phase-detail"></span></li>
+        <li data-phase="stitch"><span class="dot"></span>Stitch <span class="phase-detail"></span></li>
+      </ol>
+
+      <div id="shots-detail" class="shots"></div>
+
+      <div id="final" class="final" hidden>
+        <h3>最终成片</h3>
+        <video id="final-video" controls preload="metadata"></video>
+        <p class="meta" id="final-meta"></p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>3. 事件日志 <button id="toggle-log" class="link">展开 ▾</button></h2>
+      <pre id="log" class="log" hidden></pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

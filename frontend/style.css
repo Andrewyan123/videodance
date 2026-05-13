@@ -1,0 +1,180 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: #f5f5f7;
+  color: #1d1d1f;
+}
+header {
+  padding: 16px 24px;
+  background: #1d1d1f;
+  color: #f5f5f7;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+header .hint { font-size: 13px; opacity: 0.6; }
+
+main {
+  max-width: 900px;
+  margin: 24px auto;
+  padding: 0 24px;
+  display: grid;
+  gap: 16px;
+}
+.panel {
+  background: #fff;
+  border-radius: 10px;
+  padding: 20px 24px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+.panel h2 { margin: 0 0 14px; font-size: 16px; font-weight: 600; }
+.panel h3 { margin: 16px 0 8px; font-size: 14px; }
+
+/* form */
+form { display: grid; gap: 12px; }
+label { display: grid; gap: 6px; font-size: 13px; color: #515154; }
+textarea, input[type="number"] {
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid #d2d2d7;
+  border-radius: 8px;
+  background: #fafafa;
+}
+textarea:focus, input:focus { outline: 2px solid #0071e3; outline-offset: 1px; }
+.row { display: flex; gap: 16px; align-items: flex-end; }
+.row .grow { flex: 1; }
+.row .check { flex-direction: row; align-items: center; gap: 8px; padding-bottom: 10px; }
+button {
+  padding: 10px 20px;
+  background: #0071e3;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+}
+button:hover { background: #0061c5; }
+button:disabled { background: #aaa; cursor: not-allowed; }
+button.link {
+  background: none;
+  color: #0071e3;
+  padding: 0;
+  font-size: 12px;
+  font-weight: normal;
+}
+
+/* status / phases */
+.status {
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #f5f5f7;
+  font-size: 13px;
+  color: #515154;
+  margin-bottom: 12px;
+}
+.status.running { background: #e6f4ff; color: #0071e3; }
+.status.done { background: #e8f7ee; color: #1a7f37; }
+.status.error { background: #fef0f0; color: #c0392b; }
+
+.phases {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+.phases li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #fafafa;
+  font-size: 14px;
+  transition: background 0.2s;
+}
+.phases li.active { background: #e6f4ff; color: #0071e3; }
+.phases li.done { background: #e8f7ee; color: #1a7f37; }
+.phases li .dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #d2d2d7;
+  flex-shrink: 0;
+}
+.phases li.active .dot {
+  background: #0071e3;
+  box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.2);
+  animation: pulse 1.4s infinite;
+}
+.phases li.done .dot { background: #1a7f37; }
+.phases li.failed .dot { background: #c0392b; }
+.phase-detail { color: #86868b; font-size: 12px; margin-left: auto; }
+
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.2); }
+  50%      { box-shadow: 0 0 0 8px rgba(0, 113, 227, 0.05); }
+}
+
+/* shots detail */
+.shots {
+  margin-top: 14px;
+  display: grid;
+  gap: 8px;
+}
+.shot {
+  padding: 10px 12px;
+  border: 1px solid #e5e5e7;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+}
+.shot-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+.shot-id { font-weight: 600; }
+.shot-status { font-size: 12px; padding: 2px 8px; border-radius: 4px; background: #f5f5f7; color: #515154; }
+.shot-status.generating { background: #e6f4ff; color: #0071e3; }
+.shot-status.done { background: #e8f7ee; color: #1a7f37; }
+.shot-status.failed { background: #fef0f0; color: #c0392b; }
+.shot-progress { color: #86868b; font-size: 12px; margin-bottom: 4px; }
+.shot-thumbs { display: flex; gap: 8px; margin-top: 6px; }
+.shot-thumbs a {
+  font-size: 12px;
+  padding: 3px 8px;
+  background: #f5f5f7;
+  border-radius: 4px;
+  color: #0071e3;
+  text-decoration: none;
+}
+.shot-thumbs a:hover { background: #e5e5e7; }
+
+/* final */
+.final video {
+  width: 100%;
+  max-height: 400px;
+  border-radius: 8px;
+  background: #000;
+}
+.final .meta { font-size: 12px; color: #86868b; margin-top: 8px; }
+
+/* log */
+.log {
+  margin: 0;
+  padding: 12px;
+  background: #1d1d1f;
+  color: #d2d2d7;
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
