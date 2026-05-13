@@ -200,12 +200,29 @@ async def plan_node(state: PipelineState) -> dict[str, Any]:
 
 
 async def character_sheet_node(state: PipelineState) -> dict[str, Any]:
-    """为每个角色生成多角度参考图. 一次性, 之后所有 shot 共用"""
+    """为每个角色生成多角度参考图. 一次性, 之后所有 shot 共用.
+
+    Phase 1 集成: 若 char_id 已在资产库 (assets.store) 中存在且有 ref_image_urls,
+    直接 retrieval, 跳过 T2I. 不存在则保持原 in-pipeline 生成行为 (临时, 不写库).
+    要持久化建档, 用 `python -m assets create ...`.
+    """
+    from assets import store as asset_store
+
     sheets = state["character_sheets"]
     cost = 0.0
 
     async def gen_one(char: CharacterSheet) -> CharacterSheet:
         nonlocal cost
+
+        # 1. 尝试从 store 拿
+        existing = asset_store.get_character(char.char_id)
+        if existing and existing.ref_image_urls:
+            char.ref_image_urls = existing.ref_image_urls
+            print(f"[character_sheet] cache hit {char.char_id} "
+                  f"({len(existing.ref_image_urls)} refs from store)")
+            return char
+
+        # 2. miss → 临时生成 (不写库, 因为 t2i 返回的 URL 会过期)
         urls = []
         for angle in CHARACTER_ANGLES:
             result = await _gen_image(

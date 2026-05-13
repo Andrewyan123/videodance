@@ -9,6 +9,7 @@ __pycache__/
 # project artifacts
 video_pipeline.db
 /tmp/video1.0_stitch/
+data/
 
 # editor / OS
 .DS_Store
