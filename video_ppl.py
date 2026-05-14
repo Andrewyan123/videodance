@@ -42,8 +42,10 @@ from prompts import (
     build_video_prompt,
 )
 from providers import (
+    ImageEditResult,
     ImageResult,
     VideoResult,
+    build_image_edit_provider,
     build_image_provider,
     build_llm_provider,
     build_video_provider,
@@ -115,6 +117,7 @@ class ShotState(TypedDict):
 
 LLM_PROVIDER = build_llm_provider()
 IMAGE_PROVIDER = build_image_provider()
+IMAGE_EDIT_PROVIDER = build_image_edit_provider()
 VIDEO_PROVIDER = build_video_provider()
 
 
@@ -125,6 +128,16 @@ async def _gen_image(
         await asyncio.sleep(0.05)
         return ImageResult(url=f"mock://image/{uuid.uuid4().hex[:8]}.png")
     return await IMAGE_PROVIDER.generate(prompt, ref_images=ref_images)
+
+
+async def _gen_image_edit(
+    anchor_path: str, instruction: str, *, dry_run: bool,
+) -> ImageEditResult:
+    """i2i wrapper, 同 _gen_image 的范式 (dry_run 短路, 真路径调 provider)."""
+    if dry_run:
+        await asyncio.sleep(0.05)
+        return ImageEditResult(url=f"mock://image_edit/{uuid.uuid4().hex[:8]}.png")
+    return await IMAGE_EDIT_PROVIDER.edit(anchor_path, instruction)
 
 
 async def _gen_video(
@@ -261,16 +274,51 @@ def fanout_shots(state: PipelineState) -> list[Send]:
 # ---- Shot subgraph nodes ----
 
 async def keyframe_node(state: ShotState) -> dict[str, Any]:
-    """根据 shot prompt + char refs + global style 生成关键帧"""
-    shot = state["shot"]
-    refs = []
-    for cid in shot.character_ids:
-        refs.extend(state["char_sheets"][cid].ref_image_urls)
+    """根据 shot prompt + char refs + global style 生成关键帧.
 
-    prompt = build_keyframe_prompt(state["style"], shot.camera, shot.prompt)
-    result = await _gen_image(prompt, dry_run=state["is_dry_run"], ref_images=refs)
-    shot.keyframe_url = result.url
-    shot.cost_usd += result.cost_usd
+    Phase 1.3 范式切换: 角色有本地 anchor (file:// + 文件存在) → 走 i2i
+    (IMAGE_EDIT_PROVIDER), 用 anchor + scene instruction 派生 keyframe, 这是
+    保持人脸一致性的关键. 没 anchor (cache miss / dry_run) 回退 t2i.
+
+    Anchor 选取规则: shot.character_ids 第一个角色的 ref_image_urls 第一张
+    本地 file://. 多角色场景下次再细化 (group reference / Midjourney Omni Ref).
+    """
+    import os
+    shot = state["shot"]
+
+    # 找第一个能用的本地 anchor
+    anchor_path = None
+    for cid in shot.character_ids:
+        for url in state["char_sheets"][cid].ref_image_urls:
+            if url.startswith("file://"):
+                p = url[len("file://"):]
+                if os.path.isfile(p):
+                    anchor_path = p
+                    break
+        if anchor_path:
+            break
+
+    instruction = build_keyframe_prompt(state["style"], shot.camera, shot.prompt)
+
+    if anchor_path and not state["is_dry_run"]:
+        # i2i 范式 (推荐): anchor 锚定人脸 + instruction 换场景
+        print(f"[keyframe] i2i mode shot={shot.shot_id} anchor={os.path.basename(anchor_path)}")
+        result_edit = await _gen_image_edit(
+            anchor_path, instruction, dry_run=state["is_dry_run"],
+        )
+        shot.keyframe_url = result_edit.url
+        shot.cost_usd += result_edit.cost_usd
+    else:
+        # t2i 回退 (cache miss / dry_run): 没 anchor 时的原行为
+        if not state["is_dry_run"]:
+            print(f"[keyframe] t2i fallback shot={shot.shot_id} (no local anchor)")
+        refs = []
+        for cid in shot.character_ids:
+            refs.extend(state["char_sheets"][cid].ref_image_urls)
+        result = await _gen_image(instruction, dry_run=state["is_dry_run"], ref_images=refs)
+        shot.keyframe_url = result.url
+        shot.cost_usd += result.cost_usd
+
     shot.status = "generating"
     return {"shot": shot}
 
