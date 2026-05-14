@@ -114,6 +114,44 @@ async def build_character(
                     tasks.append(_download(sess, url, p))
                 await asyncio.gather(*tasks)
 
+        # 真实路径下抽 ArcFace embedding + 一致性总结
+        embedding = None
+        embedding_kind = None
+        consistency_notes = ""
+        if not dry_run:
+            from . import faceid
+
+            # 抽所有视图 embedding, 取 front (优先) 写进 card.embedding
+            view_embs = []
+            for p, angle in zip(local_paths, angles):
+                e = faceid.extract_embedding(p)
+                view_embs.append(e)
+                if e is None:
+                    print(f"[builder] WARN no face detected in {angle} ({p.name})")
+
+            # Gate: front view 必须能检测到人脸 (硬条件, 否则 retrieval 拿不到 embedding 比对)
+            front_idx = angles.index("front") if "front" in angles else 0
+            front_emb = view_embs[front_idx]
+            if front_emb is None:
+                raise RuntimeError(
+                    f"face not detected in {angles[front_idx]} view of '{char_id}'; "
+                    "T2I might have produced abstract / occluded face. "
+                    "try rephrasing description"
+                )
+
+            embedding = front_emb.tolist()
+            embedding_kind = "arcface_buffalo_l"
+
+            summary = faceid.consistency_summary(view_embs)
+            consistency_notes = (
+                f"cross-view cosine: mean={summary['mean']:.3f} "
+                f"(min={summary['min']:.3f}, max={summary['max']:.3f}), "
+                f"detected={summary['n_detected']}/{summary['n_total']}"
+                if summary["mean"] is not None else
+                f"insufficient detections: {summary['n_detected']}/{summary['n_total']}"
+            )
+            print(f"[builder] {char_id}: {consistency_notes}")
+
         # 构造并写 store
         card = CharacterCard(
             char_id=char_id,
@@ -122,7 +160,10 @@ async def build_character(
             style_tokens=style_tokens or [],
             ref_image_urls=[f"file://{p.resolve()}" for p in local_paths],
             required_views=list(angles),
+            embedding=embedding,
+            embedding_kind=embedding_kind,
             profile_id=profile_id,
+            notes=consistency_notes,
         )
         store.upsert_character(card)
         return card
