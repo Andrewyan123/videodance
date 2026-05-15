@@ -3,63 +3,101 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Video Pipeline</title>
-  <link rel="stylesheet" href="style.css" />
+  <title>Video Pipeline — Creative Mode</title>
+  <link rel="stylesheet" href="wizard.css" />
 </head>
 <body>
   <header>
     <h1>Video Pipeline</h1>
-    <span class="hint">LangGraph + DashScope</span>
+    <nav>
+      <span class="hint">creative mode · 抽奖 + 挑选 · 拼成片</span>
+      <a class="link" href="auto.html">(auto mode)</a>
+    </nav>
   </header>
 
+  <!-- 步骤指示器 -->
+  <ol class="steps">
+    <li data-step="1" class="active">1. 输入</li>
+    <li data-step="2">2. 角色</li>
+    <li data-step="3">3. 镜头</li>
+    <li data-step="4">4. 成片</li>
+  </ol>
+
   <main>
-    <section class="panel">
-      <h2>1. 输入</h2>
-      <form id="run-form">
+    <!-- Step 1: INPUT -->
+    <section class="panel" id="step-1">
+      <h2>1. 描述你想要的视频</h2>
+      <form id="input-form">
         <label>
-          视频描述
+          描述
           <textarea id="prompt" rows="4" required
-            placeholder="例: A young woman with red hair walks through a misty forest at dawn..."></textarea>
+            placeholder="例: A young Chinese man called Yan walks through a misty bamboo forest at dawn"></textarea>
         </label>
         <div class="row">
           <label class="grow">
             目标时长 (秒)
-            <input id="duration" type="number" min="5" max="60" step="1" value="15" />
+            <input id="duration" type="number" min="5" max="60" step="1" value="10" />
+          </label>
+          <label class="grow">
+            流派
+            <select id="profile">
+              <option value="short_drama">短剧 (写实人物 + 对白)</option>
+              <option value="anime">漫剧 / 动画 (风格化)</option>
+              <option value="cinema">电影 (镜头语言重)</option>
+              <option value="commercial">广告片 (产品 + CTA)</option>
+            </select>
           </label>
           <label class="check">
             <input id="dry-run" type="checkbox" />
-            <span>dry run (mock 不烧钱)</span>
+            <span>dry run (不烧 token)</span>
           </label>
         </div>
-        <button id="submit-btn" type="submit">Start</button>
+        <button type="submit" id="start-btn">Plan storyboard →</button>
       </form>
+      <p class="muted" id="step1-hint">planner 会出分镜结构,角色和镜头数会决定后续成本。</p>
     </section>
 
-    <section class="panel">
-      <h2>2. 进度</h2>
-      <div id="status-bar" class="status">未启动</div>
-      <ol id="phases" class="phases">
-        <li data-phase="plan"><span class="dot"></span>Planner <span class="phase-detail"></span></li>
-        <li data-phase="character_sheets"><span class="dot"></span>Character sheets <span class="phase-detail"></span></li>
-        <li data-phase="shots"><span class="dot"></span>Shots <span class="phase-detail"></span></li>
-        <li data-phase="stitch"><span class="dot"></span>Stitch <span class="phase-detail"></span></li>
-      </ol>
-
-      <div id="shots-detail" class="shots"></div>
-
-      <div id="final" class="final" hidden>
-        <h3>最终成片</h3>
-        <video id="final-video" controls preload="metadata"></video>
-        <p class="meta" id="final-meta"></p>
+    <!-- Step 2: CHARS -->
+    <section class="panel hidden" id="step-2">
+      <h2>2. 为每个角色挑选定妆照</h2>
+      <p class="muted">每张候选都用 InsightFace 抽过 embedding,挑中的会作为 i2i 的 anchor。</p>
+      <div id="chars-container"></div>
+      <div class="step-nav">
+        <button class="secondary" id="chars-back">← 改输入</button>
+        <button id="chars-next" disabled>Next: Shots →</button>
       </div>
     </section>
 
-    <section class="panel">
-      <h2>3. 事件日志 <button id="toggle-log" class="link">展开 ▾</button></h2>
-      <pre id="log" class="log" hidden></pre>
+    <!-- Step 3: SHOTS (tree) -->
+    <section class="panel hidden" id="step-3">
+      <h2>3. 为每个镜头挑选视频</h2>
+      <p class="muted">每段视频显示 identity score (跟所选角色脸的余弦相似度)。点击预览,点边框选中。</p>
+      <div id="shots-tree" class="tree"></div>
+      <div class="step-nav">
+        <button class="secondary" id="shots-back">← 改角色</button>
+        <button id="shots-stitch" disabled>Stitch & Preview →</button>
+      </div>
+    </section>
+
+    <!-- Step 4: RESULT -->
+    <section class="panel hidden" id="step-4">
+      <h2>4. 最终成片</h2>
+      <div id="final-result">
+        <p class="muted" id="stitch-status">拼接中…</p>
+      </div>
+      <div class="step-nav">
+        <button class="secondary" id="result-back">← 改选择</button>
+        <button class="secondary" id="result-restart">Start over</button>
+      </div>
     </section>
   </main>
 
-  <script src="app.js"></script>
+  <!-- 日志面板 (可折叠, 用户可见) -->
+  <aside class="logs">
+    <h3>事件日志 <button id="toggle-log" class="link">展开 ▾</button></h3>
+    <pre id="log" hidden></pre>
+  </aside>
+
+  <script src="wizard.js"></script>
 </body>
 </html>
