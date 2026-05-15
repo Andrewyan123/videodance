@@ -219,13 +219,20 @@ class RunRequest(BaseModel):
     user_prompt: str
     target_duration_sec: float = 15.0
     dry_run: bool = True
+    profile_id: str = "short_drama"
+    mode: str = "auto"  # "auto" (legacy full pipeline) | "interactive" (storyboard then pause)
 
 
 app = FastAPI(title="Video Pipeline")
 
 
 @app.post("/api/runs")
-async def start_run(req: RunRequest) -> dict[str, str]:
+async def start_run(req: RunRequest) -> dict[str, Any]:
+    """启动一个 run.
+    - mode=auto: 跟现有行为一致, 全自动跑到底, SSE 推进度
+    - mode=interactive: 只跑 planner 出 storyboard, 入库 sessions 表, 后续由
+      /characters/.../propose + /shots/.../propose + /stitch 接力
+    """
     thread_id = f"run-{uuid.uuid4().hex[:8]}"
     ctx = RunContext(
         thread_id=thread_id,
@@ -233,8 +240,53 @@ async def start_run(req: RunRequest) -> dict[str, str]:
         state={"phase": "starting"},
     )
     _runs[thread_id] = ctx
+
+    if req.mode == "interactive":
+        # 同步跑 planner, 返回 storyboard
+        from profiles import get_profile
+        from storyboard.planner import generate_storyboard
+        from candidates import store as cand_store
+        from candidates.schema import Session
+
+        profile = get_profile(req.profile_id)
+        if req.dry_run:
+            # dry_run 不调 LLM, 构造一个最小 mock storyboard
+            sb_json = (
+                '{"schema_version":1,"global_style":"mock","characters":'
+                '[{"char_id":"alice","name":"Alice","description":"mock young woman"}],'
+                '"shots":[{"shot_id":"S01","index":0,"duration_sec":5,'
+                '"character_ids":["alice"],"action":"mock action",'
+                '"shot_type":"medium","camera":{"angle":"eye_level","movement":"static"},'
+                '"emotion":"neutral"}]}'
+            )
+        else:
+            sb, _report, _metrics = await generate_storyboard(
+                user_prompt=req.user_prompt,
+                target_duration_sec=req.target_duration_sec,
+                profile=profile,
+                check_store=False,  # 还没建 character, 跳过 store 检查
+            )
+            sb_json = sb.model_dump_json()
+
+        sess = Session(
+            thread_id=thread_id,
+            user_prompt=req.user_prompt,
+            target_duration_sec=req.target_duration_sec,
+            profile_id=req.profile_id,
+            storyboard_json=sb_json,
+            status="proposing",
+        )
+        cand_store.upsert_session(sess)
+
+        return {
+            "thread_id": thread_id,
+            "mode": "interactive",
+            "storyboard": json.loads(sb_json),
+        }
+
+    # mode == "auto": existing behavior
     ctx.task = asyncio.create_task(_execute(ctx, req))
-    return {"thread_id": thread_id}
+    return {"thread_id": thread_id, "mode": "auto"}
 
 
 @app.get("/api/runs/{thread_id}/events")
@@ -291,6 +343,245 @@ async def serve_video(path: str = Query(...)):
     if not os.path.isfile(real):
         raise HTTPException(404)
     return FileResponse(real, media_type="video/mp4")
+
+
+# =============================================================================
+# Interactive endpoints (Phase 5.1)
+# =============================================================================
+
+
+def _emit_factory(thread_id: str):
+    """给 builder 用的 emit callback: 把事件推到 SSE 队列(如果有)."""
+    ctx = _runs.get(thread_id)
+    async def emit(event: dict):
+        if ctx:
+            await ctx.queue.put(event)
+    return emit
+
+
+def _get_session_or_404(thread_id: str):
+    from candidates import store as cand_store
+    s = cand_store.get_session(thread_id)
+    if s is None:
+        raise HTTPException(404, f"unknown session {thread_id}")
+    return s
+
+
+def _get_storyboard_from_session(s) -> dict:
+    return json.loads(s.storyboard_json)
+
+
+@app.get("/api/runs/{thread_id}/storyboard")
+async def get_storyboard(thread_id: str) -> dict[str, Any]:
+    s = _get_session_or_404(thread_id)
+    return _get_storyboard_from_session(s)
+
+
+@app.post("/api/runs/{thread_id}/characters/{char_id}/propose")
+async def propose_chars(thread_id: str, char_id: str, n: int = 4) -> dict[str, Any]:
+    from candidates.builder import propose_character_variants
+    from candidates import store as cand_store
+
+    s = _get_session_or_404(thread_id)
+    sb = _get_storyboard_from_session(s)
+
+    # 找 char_id 对应的 description
+    chars = sb.get("characters", [])
+    target = next((c for c in chars if c["char_id"] == char_id), None)
+    if target is None:
+        raise HTTPException(404, f"char_id {char_id} not in storyboard")
+
+    variants = await propose_character_variants(
+        thread_id=thread_id, char_id=char_id, n=n,
+        description=target.get("description", target.get("name", "")),
+        profile_id=s.profile_id,
+        emit=_emit_factory(thread_id),
+    )
+    return {"variants": [v.model_dump() for v in variants]}
+
+
+@app.post("/api/runs/{thread_id}/characters/{char_id}/select")
+async def select_char(thread_id: str, char_id: str, variant: int = Query(...)) -> dict[str, Any]:
+    from candidates import store as cand_store
+    from candidates.builder import promote_character_to_canonical
+    _get_session_or_404(thread_id)
+    if not cand_store.select_character_candidate(thread_id, char_id, variant):
+        raise HTTPException(404, f"variant {variant} not found for char {char_id}")
+    # 把 selected 提升到 canonical assets/store, 供下游 i2i 用
+    promote_character_to_canonical(thread_id=thread_id, char_id=char_id)
+    return {"selected": variant, "char_id": char_id, "promoted_to_assets": True}
+
+
+def _build_shot_from_storyboard(sb: dict, shot_id: str):
+    """从 storyboard JSON 构造 video_ppl.Shot 用于 propose."""
+    from video_ppl import Shot
+    shots = sb.get("shots", [])
+    raw = next((s for s in shots if s["shot_id"] == shot_id), None)
+    if raw is None:
+        raise HTTPException(404, f"shot_id {shot_id} not in storyboard")
+    cam = raw.get("camera") or {}
+    dlg = raw.get("dialogue") or {}
+    return Shot(
+        shot_id=raw["shot_id"], index=raw["index"],
+        prompt=raw.get("action", ""),
+        duration_sec=raw["duration_sec"],
+        character_ids=raw.get("character_ids", []),
+        camera=f"{raw.get('shot_type', 'medium')}, {cam.get('angle','eye_level')}, {cam.get('movement','static')}",
+        shot_type=raw.get("shot_type", "medium"),
+        camera_angle=cam.get("angle", "eye_level"),
+        camera_movement=cam.get("movement", "static"),
+        emotion=raw.get("emotion", "neutral"),
+        action_start=raw.get("action_start"),
+        action_end=raw.get("action_end"),
+        dialogue_speaker=dlg.get("speaker") if dlg else None,
+        dialogue_text=dlg.get("text") if dlg else None,
+    )
+
+
+@app.post("/api/runs/{thread_id}/shots/{shot_id}/propose")
+async def propose_shots(thread_id: str, shot_id: str, n: int = 3) -> dict[str, Any]:
+    from candidates.builder import propose_shot_variants
+    s = _get_session_or_404(thread_id)
+    sb = _get_storyboard_from_session(s)
+    shot = _build_shot_from_storyboard(sb, shot_id)
+    variants = await propose_shot_variants(
+        thread_id=thread_id, shot_id=shot_id, shot=shot, n=n,
+        profile_id=s.profile_id,
+        emit=_emit_factory(thread_id),
+    )
+    return {"variants": [v.model_dump() for v in variants]}
+
+
+@app.post("/api/runs/{thread_id}/shots/{shot_id}/select")
+async def select_shot(thread_id: str, shot_id: str, variant: int = Query(...)) -> dict[str, Any]:
+    from candidates import store as cand_store
+    _get_session_or_404(thread_id)
+    if not cand_store.select_shot_candidate(thread_id, shot_id, variant):
+        raise HTTPException(404, f"variant {variant} not found for shot {shot_id}")
+    return {"selected": variant, "shot_id": shot_id}
+
+
+@app.get("/api/runs/{thread_id}/tree")
+async def get_tree(thread_id: str) -> dict[str, Any]:
+    """Run 的完整树状态: storyboard + 每个 char/shot 的所有 candidates + selection state."""
+    from candidates import store as cand_store
+    s = _get_session_or_404(thread_id)
+    sb = _get_storyboard_from_session(s)
+
+    chars_data = []
+    for c in sb.get("characters", []):
+        cid = c["char_id"]
+        cands = cand_store.list_character_candidates(thread_id, cid)
+        chars_data.append({
+            "char_id": cid,
+            "name": c["name"],
+            "description": c.get("description", ""),
+            "candidates": [v.model_dump() for v in cands],
+        })
+
+    shots_data = []
+    for sh in sb.get("shots", []):
+        sid = sh["shot_id"]
+        cands = cand_store.list_shot_candidates(thread_id, sid)
+        shots_data.append({
+            "shot_id": sid,
+            "index": sh["index"],
+            "duration_sec": sh["duration_sec"],
+            "action": sh.get("action", ""),
+            "shot_type": sh.get("shot_type", "medium"),
+            "character_ids": sh.get("character_ids", []),
+            "candidates": [v.model_dump() for v in cands],
+        })
+
+    return {
+        "thread_id": thread_id,
+        "user_prompt": s.user_prompt,
+        "profile_id": s.profile_id,
+        "status": s.status,
+        "global_style": sb.get("global_style", ""),
+        "characters": chars_data,
+        "shots": shots_data,
+        "final_video_url": s.final_video_url,
+    }
+
+
+@app.post("/api/runs/{thread_id}/stitch")
+async def stitch_selected(thread_id: str) -> dict[str, Any]:
+    """按 storyboard.shots 顺序拉 selected video URLs, 下载 + ffmpeg concat."""
+    import uuid as _uuid
+    import aiohttp
+    from candidates import store as cand_store
+    s = _get_session_or_404(thread_id)
+    sb = _get_storyboard_from_session(s)
+
+    # 按 shot index 顺序拉 selected
+    ordered_shot_ids = [x["shot_id"] for x in sorted(sb.get("shots", []), key=lambda x: x["index"])]
+    selected_urls: list[str] = []
+    missing: list[str] = []
+    for sid in ordered_shot_ids:
+        cands = cand_store.list_shot_candidates(thread_id, sid)
+        sel = [c for c in cands if c.selected]
+        if sel and sel[0].video_url:
+            selected_urls.append(sel[0].video_url)
+        else:
+            missing.append(sid)
+
+    if missing:
+        raise HTTPException(400, f"missing selection for shots: {missing}")
+    if not selected_urls:
+        raise HTTPException(400, "no shots selected")
+
+    # 下载 + concat (复用 video_ppl stitch 逻辑)
+    out_dir = Path(os.environ.get("STITCH_OUT_DIR", "/tmp/video1.0_stitch"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_id = _uuid.uuid4().hex[:8]
+    work_dir = out_dir / f"interactive_{run_id}"
+    work_dir.mkdir()
+
+    local_paths = []
+    async with aiohttp.ClientSession() as sess:
+        for i, url in enumerate(selected_urls):
+            p = work_dir / f"shot_{i:03d}.mp4"
+            local_paths.append(p)
+            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=300)) as r:
+                r.raise_for_status()
+                with open(p, "wb") as f:
+                    async for chunk in r.content.iter_chunked(1 << 16):
+                        f.write(chunk)
+
+    list_path = work_dir / "concat.txt"
+    list_path.write_text("\n".join(f"file '{p}'" for p in local_paths))
+    final_path = out_dir / f"final_interactive_{run_id}.mp4"
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-c", "copy", str(final_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        # 回退 re-encode
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "128k", str(final_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise HTTPException(500, f"ffmpeg failed: {err.decode('utf-8', errors='replace')[-400:]}")
+
+    final_url = f"file://{final_path}"
+    # 更新 session
+    s.final_video_url = final_url
+    s.status = "done"
+    cand_store.upsert_session(s)
+
+    return {
+        "final_video_url": final_url,
+        "size_bytes": final_path.stat().st_size,
+        "shot_count": len(selected_urls),
+    }
 
 
 # =============================================================================
