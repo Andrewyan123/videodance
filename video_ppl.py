@@ -91,6 +91,7 @@ def merge_shots(left: dict[str, Shot], right: dict[str, Shot]) -> dict[str, Shot
 class PipelineState(TypedDict):
     user_prompt: str
     target_duration_sec: float
+    profile_id: str  # Phase 2 加: short_drama / anime / cinema / commercial
     global_style: str
     character_sheets: dict[str, CharacterSheet]
     shot_list: list[Shot]
@@ -172,7 +173,14 @@ async def _vlm_critic_check(
 
 
 async def plan_node(state: PipelineState) -> dict[str, Any]:
-    """Planner: 用户 prompt -> shot list + character sheets + global style"""
+    """Planner: 用户 prompt -> shot list + character sheets + global style.
+
+    Phase 2: 改用 storyboard.generate_storyboard (严格 Pydantic schema + jsonrepair
+    + 引用解析). 输出新 schema (含 shot_type/camera.angle/movement/emotion/dialogue
+    等丰富字段) 后, 转换成现有 Shot/CharacterSheet dataclass 保持下游兼容.
+    多余字段 (dialogue/emotion/scene_ref/props) 暂时丢弃, 等 Phase 3+ 接入 keyframe /
+    audio 节点时再串起来.
+    """
     if state["dry_run"]:
         chars = {"alice": CharacterSheet("alice", "Alice", "young woman, red hair")}
         shots = [
@@ -189,22 +197,41 @@ async def plan_node(state: PipelineState) -> dict[str, Any]:
             "shots": {s.shot_id: s for s in shots},
         }
 
-    msg = await LLM_PROVIDER.ainvoke([
-        {"role": "system", "content": PLANNER_SYSTEM},
-        {"role": "user", "content": build_planner_user(
-            state["user_prompt"], state["target_duration_sec"],
-        )},
-    ])
-    raw = msg.content.strip()
-    if raw.startswith("```"):
-        # 去掉首行 ```json 和末行 ```
-        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    plan = json.loads(raw)
+    from profiles import get_profile
+    from storyboard.planner import generate_storyboard
 
-    chars = {c["char_id"]: CharacterSheet(**c) for c in plan["characters"]}
-    shots = [Shot(**s) for s in plan["shots"]]
+    profile = get_profile(state.get("profile_id") or "short_drama")
+    sb, report, metrics = await generate_storyboard(
+        user_prompt=state["user_prompt"],
+        target_duration_sec=state["target_duration_sec"],
+        profile=profile,
+    )
+    print(f"[plan] {report.summary()} (LLM calls={metrics['n_llm_calls']}, "
+          f"repair={metrics['last_repair_mode']})")
+    if report.missing_chars:
+        print(f"[plan] WARN @char_id 未在 asset 库: {report.missing_chars} "
+              f"(运行时会走 t2i fallback)")
+
+    # 转换 v1 schema → 现有 dataclass
+    chars = {
+        c.char_id: CharacterSheet(
+            char_id=c.char_id, name=c.name, description=c.description,
+        )
+        for c in sb.characters
+    }
+    shots = [
+        Shot(
+            shot_id=s.shot_id, index=s.index,
+            prompt=s.action,  # ShotV1.action -> Shot.prompt
+            duration_sec=s.duration_sec,
+            character_ids=s.character_ids,
+            # 把 shot_type + camera 拼成字符串塞 Shot.camera (旧接口)
+            camera=f"{s.shot_type}, {s.camera.as_string()}",
+        )
+        for s in sb.shots
+    ]
     return {
-        "global_style": plan["global_style"],
+        "global_style": sb.global_style,
         "character_sheets": chars,
         "shot_list": shots,
         "shots": {s.shot_id: s for s in shots},
@@ -497,6 +524,7 @@ def build_main_graph(checkpointer):
 async def run_pipeline(
     user_prompt: str,
     target_duration_sec: float = 30.0,
+    profile_id: str = "short_drama",
     dry_run: bool = True,
     thread_id: str | None = None,
 ) -> PipelineState:
@@ -509,6 +537,7 @@ async def run_pipeline(
         initial: PipelineState = {
             "user_prompt": user_prompt,
             "target_duration_sec": target_duration_sec,
+            "profile_id": profile_id,
             "global_style": "",
             "character_sheets": {},
             "shot_list": [],

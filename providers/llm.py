@@ -1,13 +1,95 @@
 """LLM providers."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import random
 from typing import Any
 
 import aiohttp
 
 from .base import LLMResponse
+
+log = logging.getLogger("video_pipeline.llm")
+
+# 429 退避: 同 _dashscope, 等价指数退避 + jitter
+_MAX_429_RETRIES = 6
+_MAX_BACKOFF = 30.0
+
+
+_RATE_LIMIT_HINTS = ("rate limit", "rate_limit", "Throttling",
+                     "exceed", "limit_requests", "too many", "429")
+
+# 上游 5xx 类(infrastructure 故障, 跟限流处理逻辑一致 — 退避+重试)
+_TRANSIENT_HINTS = ("Overloaded", "Internal server error",
+                    "service unavailable", "service_unavailable",
+                    "Bad Gateway", "Gateway Timeout",
+                    "500", "502", "503", "504", "529")
+
+
+def _is_retryable(status: int, body_text: str) -> bool:
+    """判定是否退避重试. 涵盖:
+    - 429 直接限流
+    - 4xx/5xx wrap 上游 429 (DashScope 经常用 418 wrap)
+    - 5xx (500/502/503/504/529) 临时故障
+    排除:"per day / quota / daily" 这种永久性, 退避救不回.
+    """
+    low = body_text.lower()
+    # 永久性 quota 不重试 (在 status check 前先排除)
+    if "per day" in low or "daily" in low or ("quota" in low and "exceed" in low):
+        return False
+
+    if status == 429:
+        return True
+
+    if status >= 500:
+        # 直 5xx, retry
+        return True
+
+    if status >= 400:
+        # 4xx 包括 418-wrapped: 看 body 有限流 / 上游 5xx 关键词
+        if any(h.lower() in low for h in _RATE_LIMIT_HINTS):
+            return True
+        if any(h.lower() in low for h in _TRANSIENT_HINTS):
+            return True
+    return False
+
+
+# 保留旧名给可能的外部引用
+_is_rate_limited = _is_retryable
+
+
+async def _post_chat_completion(
+    sess: aiohttp.ClientSession,
+    url: str,
+    *,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    timeout_sec: float,
+) -> dict[str, Any]:
+    """POST /chat/completions + rate-limit 指数退避. 其他 4xx/5xx 直接 raise."""
+    for attempt in range(_MAX_429_RETRIES + 1):
+        async with sess.post(
+            url, json=body, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout_sec),
+        ) as resp:
+            text = await resp.text()
+            if _is_retryable(resp.status, text):
+                if attempt >= _MAX_429_RETRIES:
+                    raise RuntimeError(
+                        f"LLM retry exhausted after {attempt} attempts (status={resp.status}): {text[:300]}"
+                    )
+                wait = min(2 ** attempt + random.random(), _MAX_BACKOFF)
+                log.warning("LLM transient (status=%d), attempt %d/%d, sleep %.1fs",
+                            resp.status, attempt + 1, _MAX_429_RETRIES, wait)
+                await asyncio.sleep(wait)
+                continue
+            if resp.status >= 400:
+                raise RuntimeError(f"LLM HTTP {resp.status}: {text[:500]}")
+            return json.loads(text)
+    raise AssertionError("unreachable")
 
 
 class AnthropicCompatClient:
@@ -62,14 +144,9 @@ class AnthropicCompatClient:
         url = f"{self.base_url}/chat/completions"
 
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                url, json=body, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=self.timeout_sec),
-            ) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    raise RuntimeError(f"LLM HTTP {resp.status}: {text[:500]}")
-                data = json.loads(text)
+            data = await _post_chat_completion(
+                sess, url, body=body, headers=headers, timeout_sec=self.timeout_sec,
+            )
 
         content = "".join(
             b.get("text", "")
@@ -125,14 +202,9 @@ class OpenAICompatClient:
         url = f"{self.base_url}/chat/completions"
 
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                url, json=body, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=self.timeout_sec),
-            ) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    raise RuntimeError(f"LLM HTTP {resp.status}: {text[:500]}")
-                data = json.loads(text)
+            data = await _post_chat_completion(
+                sess, url, body=body, headers=headers, timeout_sec=self.timeout_sec,
+            )
 
         content = data["choices"][0]["message"].get("content") or ""
         return LLMResponse(content=content, raw=data)
