@@ -61,6 +61,16 @@ def _is_retryable(status: int, body_text: str) -> bool:
 _is_rate_limited = _is_retryable
 
 
+# 网络层 transient: aiohttp 抛 ClientConnectionError 系列; asyncio.TimeoutError
+# 在 ClientTimeout 触发时由 aiohttp wrap 抛出. 都跟 5xx 一样退避 + 重试.
+_NETWORK_TRANSIENT_EXC: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    aiohttp.ServerTimeoutError,
+    aiohttp.ClientConnectionError,  # 含 ClientConnectorError / ServerDisconnectedError
+    aiohttp.ClientPayloadError,
+)
+
+
 async def _post_chat_completion(
     sess: aiohttp.ClientSession,
     url: str,
@@ -69,26 +79,43 @@ async def _post_chat_completion(
     headers: dict[str, str],
     timeout_sec: float,
 ) -> dict[str, Any]:
-    """POST /chat/completions + rate-limit 指数退避. 其他 4xx/5xx 直接 raise."""
+    """POST /chat/completions + rate-limit + network-transient 指数退避.
+
+    重试触发条件 (任一):
+      - HTTP 状态码 _is_retryable (429 / 4xx-wrapped 限流 / 5xx)
+      - asyncio.TimeoutError / aiohttp 网络层异常
+    其他 4xx 直接 raise.
+    """
     for attempt in range(_MAX_429_RETRIES + 1):
-        async with sess.post(
-            url, json=body, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout_sec),
-        ) as resp:
-            text = await resp.text()
-            if _is_retryable(resp.status, text):
-                if attempt >= _MAX_429_RETRIES:
-                    raise RuntimeError(
-                        f"LLM retry exhausted after {attempt} attempts (status={resp.status}): {text[:300]}"
-                    )
-                wait = min(2 ** attempt + random.random(), _MAX_BACKOFF)
-                log.warning("LLM transient (status=%d), attempt %d/%d, sleep %.1fs",
-                            resp.status, attempt + 1, _MAX_429_RETRIES, wait)
-                await asyncio.sleep(wait)
-                continue
-            if resp.status >= 400:
-                raise RuntimeError(f"LLM HTTP {resp.status}: {text[:500]}")
-            return json.loads(text)
+        try:
+            async with sess.post(
+                url, json=body, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout_sec),
+            ) as resp:
+                text = await resp.text()
+                if _is_retryable(resp.status, text):
+                    if attempt >= _MAX_429_RETRIES:
+                        raise RuntimeError(
+                            f"LLM retry exhausted after {attempt} attempts (status={resp.status}): {text[:300]}"
+                        )
+                    wait = min(2 ** attempt + random.random(), _MAX_BACKOFF)
+                    log.warning("LLM transient (status=%d), attempt %d/%d, sleep %.1fs",
+                                resp.status, attempt + 1, _MAX_429_RETRIES, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status >= 400:
+                    raise RuntimeError(f"LLM HTTP {resp.status}: {text[:500]}")
+                return json.loads(text)
+        except _NETWORK_TRANSIENT_EXC as e:
+            if attempt >= _MAX_429_RETRIES:
+                raise RuntimeError(
+                    f"LLM network-transient retry exhausted after {attempt} attempts: {type(e).__name__}: {e}"
+                ) from e
+            wait = min(2 ** attempt + random.random(), _MAX_BACKOFF)
+            log.warning("LLM %s (timeout=%.0fs), attempt %d/%d, sleep %.1fs",
+                        type(e).__name__, timeout_sec, attempt + 1, _MAX_429_RETRIES, wait)
+            await asyncio.sleep(wait)
+            continue
     raise AssertionError("unreachable")
 
 
