@@ -41,7 +41,12 @@ from .base import (
 from .image import DashScopeT2I, OpenAIImageClient
 from .image_edit import GPTImageEditClient, QwenImageEditClient, WanxI2IClient
 from .llm import AnthropicCompatClient, OpenAICompatClient
-from .video import DashScopeI2V, JiMengClient, SeedDanceClient
+from .video import (
+    DashScopeI2V,
+    JiMengClient,
+    SeedDanceClient,
+    WanxI2VPlusClient,
+)
 
 
 def build_llm_provider() -> LLMProvider:
@@ -76,12 +81,16 @@ def build_image_edit_provider() -> ImageEditProvider:
     raise ValueError(f"unknown IMAGE_EDIT_PROVIDER: {name}")
 
 
-def build_video_provider() -> VideoProvider:
-    name = os.environ.get("VIDEO_PROVIDER", "dashscope_i2v")
-    # I2V_MODEL 显式设了就用; 否则让 backend class 自带默认 (避免把 wanx 模型名传给 seeddance)
+def build_video_provider(name: str | None = None) -> VideoProvider:
+    """构造 video provider. name=None 时读 env, 否则用传入的 (供 router 调用)."""
+    name = name or os.environ.get("VIDEO_PROVIDER", "dashscope_i2v")
+    # I2V_MODEL 显式设了就用; 否则让 backend class 自带默认
     explicit_model = os.environ.get("I2V_MODEL")
     if name == "dashscope_i2v":
         return DashScopeI2V(model=explicit_model or "wanx2.1-i2v-turbo")
+    if name == "wanx_i2v_plus":
+        # 首尾帧 i2v, Phase 3.2 引入
+        return WanxI2VPlusClient(model=explicit_model or "wanx2.1-kf2v-plus")
     if name == "seeddance":
         return SeedDanceClient(model=explicit_model) if explicit_model else SeedDanceClient()
     if name == "jimeng":
@@ -97,6 +106,6 @@ __all__ = [
     "AnthropicCompatClient", "OpenAICompatClient",
     "DashScopeT2I", "OpenAIImageClient",
     "WanxI2IClient", "QwenImageEditClient", "GPTImageEditClient",
-    "DashScopeI2V", "SeedDanceClient", "JiMengClient",
+    "DashScopeI2V", "WanxI2VPlusClient", "SeedDanceClient", "JiMengClient",
     "build_llm_provider", "build_image_provider", "build_image_edit_provider", "build_video_provider",
 ]

@@ -128,6 +128,7 @@ class ShotState(TypedDict):
     prev_last_frame_url: str | None
     is_dry_run: bool
     keyframe_strategy: str  # Phase 3.1: "single" | "first_last" | "n_grid"
+    pipeline_profile_id: str  # Phase 3.2: video_node 用 router 时需要 (避开父 state 同名键碰撞)
 
 
 # =============================================================================
@@ -314,7 +315,8 @@ def fanout_shots(state: PipelineState) -> list[Send]:
     第一版并行生成所有 shots, 用 character_sheets 做一致性. 严格 last->first 链需改 sequential.
     """
     from profiles import get_profile
-    profile = get_profile(state.get("profile_id") or "short_drama")
+    profile_id = state.get("profile_id") or "short_drama"
+    profile = get_profile(profile_id)
 
     sends = []
     sorted_shots = sorted(state["shot_list"], key=lambda s: s.index)
@@ -326,6 +328,7 @@ def fanout_shots(state: PipelineState) -> list[Send]:
             "prev_last_frame_url": None,
             "is_dry_run": state["dry_run"],
             "keyframe_strategy": profile.keyframe_strategy,
+            "pipeline_profile_id": profile_id,  # Phase 3.2: video_node router 用
         }))
     return sends
 
@@ -437,17 +440,39 @@ async def keyframe_node(state: ShotState) -> dict[str, Any]:
 
 
 async def video_node(state: ShotState) -> dict[str, Any]:
-    """关键帧 -> i2v 视频"""
+    """关键帧 -> i2v 视频.
+
+    Phase 3.2: 用 generation/router.py 按 profile 选 backend, 失败 fallback;
+    keyframe_strategy=="first_last" 且 shot.last_keyframe_url 有值时, 传双帧给支持的 backend.
+    """
     shot = state["shot"]
     first_frame = state.get("prev_last_frame_url") or shot.keyframe_url
     assert first_frame, "need a first frame"
 
-    result = await _gen_video(
-        prompt=build_video_prompt(shot.prompt),
-        first_frame_url=first_frame,
-        duration_sec=shot.duration_sec,
-        dry_run=state["is_dry_run"],
-    )
+    # 双帧策略时, 把 last_keyframe_url 传给 router
+    last_frame_in = shot.last_keyframe_url if state.get("keyframe_strategy") == "first_last" else None
+
+    if state["is_dry_run"]:
+        # dry_run 短路: 不调 router
+        result = await _gen_video(
+            prompt=build_video_prompt(shot.prompt),
+            first_frame_url=first_frame,
+            duration_sec=shot.duration_sec,
+            dry_run=True,
+        )
+    else:
+        # 真实路径: 通过 router 选 backend
+        from profiles import get_profile
+        from generation.router import generate_video
+        profile = get_profile(state.get("pipeline_profile_id") or "short_drama")
+        result = await generate_video(
+            profile=profile,
+            prompt=build_video_prompt(shot.prompt),
+            first_frame_url=first_frame,
+            last_frame_url=last_frame_in,
+            duration_sec=shot.duration_sec,
+        )
+
     shot.video_url = result.video_url
     shot.last_frame_url = result.last_frame_url
     shot.cost_usd += result.cost_usd
