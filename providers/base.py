@@ -75,4 +75,5 @@ class VideoProvider(Protocol):
         first_frame_url: str,
         duration_sec: float,
         last_frame_url: str | None = None,  # Phase 3.2: 首尾帧 i2v 支持
+        seed: int | None = None,             # Phase 4.1: critic-driven retry 用
     ) -> VideoResult: ...

@@ -63,21 +63,31 @@ async def generate_video(
     first_frame_url: str,
     last_frame_url: str | None,
     duration_sec: float,
-) -> VideoResult:
+    seed: int | None = None,            # Phase 4.1: critic-driven retry 传 seed
+    force_backend: str | None = None,   # Phase 4.1: critic 升级 backend 时覆盖 profile 偏好
+) -> tuple[VideoResult, str]:
     """按 profile 偏好 + fallback 链选 backend 调 i2v.
 
     Args:
         profile: 当前 run 的 Profile (video_backend_preferred + video_backend_fallback)
         first_frame_url: 必填 (i2v 至少要个起始帧)
         last_frame_url: 可选; 若提供, 自动选支持双帧的 backend
+        seed: 可选, 透传到 backend (deterministic retry)
+        force_backend: 可选, profile-style name; 覆盖 preferred, 优先在 chain 最前
 
     Returns:
-        VideoResult (含 video_url / cost_usd)
+        (VideoResult, factory_name_used)  — Phase 4.1: 也返回真正用了哪个 backend, 便于落库
 
     Raises:
         RuntimeError: 所有 backend (preferred + fallback) 都失败
     """
-    candidates = [profile.video_backend_preferred, *profile.video_backend_fallback]
+    # 把 force_backend 插在 chain 最前
+    if force_backend:
+        candidates = [force_backend, profile.video_backend_preferred,
+                      *profile.video_backend_fallback]
+    else:
+        candidates = [profile.video_backend_preferred, *profile.video_backend_fallback]
+
     has_last = bool(last_frame_url)
     seen_factory: set[str] = set()
     last_err: Exception | None = None
@@ -85,7 +95,6 @@ async def generate_video(
     for pref in candidates:
         factory_name = resolve_backend(pref, has_last_frame=has_last)
         if factory_name in seen_factory:
-            # 同 factory 多次出现 (preferred 和 fallback 解到同一处) 跳过
             continue
         seen_factory.add(factory_name)
 
@@ -97,13 +106,16 @@ async def generate_video(
             continue
 
         try:
-            log.info("router: trying %s (from profile pref=%s)", factory_name, pref)
-            return await provider.generate(
+            log.info("router: trying %s (from profile pref=%s, seed=%s)",
+                     factory_name, pref, seed)
+            result = await provider.generate(
                 prompt=prompt,
                 first_frame_url=first_frame_url,
                 duration_sec=duration_sec,
                 last_frame_url=last_frame_url,
+                seed=seed,
             )
+            return result, factory_name
         except (NotImplementedError, RuntimeError) as e:
             log.warning("router: backend %s failed: %s — falling back",
                         factory_name, str(e)[:200])

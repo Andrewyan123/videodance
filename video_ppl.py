@@ -71,6 +71,7 @@ class Shot:
 
     Phase 3.1 加了富字段(shot_type / camera_angle / camera_movement / emotion / scene_ref /
     dialogue_speaker / dialogue_text)和 action_start/end + last_keyframe_url.
+    Phase 4.1 加了 critic-driven retry 字段 (retry_seed / retry_force_backend / last_backend_used).
     向后兼容: 旧 `prompt` 仍 = action, 旧 `camera` 仍 = 拼好的字符串.
     """
     shot_id: str
@@ -94,6 +95,10 @@ class Shot:
     action_end: str | None = None
     dialogue_speaker: str | None = None
     dialogue_text: str | None = None
+    # === Phase 4.1 critic-driven retry (critic_node 写, video_node 读, 用完清) ===
+    retry_seed: int | None = None
+    retry_force_backend: str | None = None      # profile-style name (router 解析)
+    last_backend_used: str | None = None        # factory name (DB 落库用)
     # === 状态 ===
     status: Literal["pending", "generating", "done", "failed"] = "pending"
     retry_count: int = 0
@@ -110,6 +115,7 @@ class PipelineState(TypedDict):
     user_prompt: str
     target_duration_sec: float
     profile_id: str  # Phase 2 加: short_drama / anime / cinema / commercial
+    thread_id: str   # Phase 4.1: critic store 落库需要
     global_style: str
     character_sheets: dict[str, CharacterSheet]
     shot_list: list[Shot]
@@ -129,6 +135,7 @@ class ShotState(TypedDict):
     is_dry_run: bool
     keyframe_strategy: str  # Phase 3.1: "single" | "first_last" | "n_grid"
     pipeline_profile_id: str  # Phase 3.2: video_node 用 router 时需要 (避开父 state 同名键碰撞)
+    pipeline_thread_id: str  # Phase 4.1: critic store 落库需要
 
 
 # =============================================================================
@@ -329,6 +336,7 @@ def fanout_shots(state: PipelineState) -> list[Send]:
             "is_dry_run": state["dry_run"],
             "keyframe_strategy": profile.keyframe_strategy,
             "pipeline_profile_id": profile_id,  # Phase 3.2: video_node router 用
+            "pipeline_thread_id": state.get("thread_id") or "ad-hoc",  # Phase 4.1: critic DB
         }))
     return sends
 
@@ -442,8 +450,8 @@ async def keyframe_node(state: ShotState) -> dict[str, Any]:
 async def video_node(state: ShotState) -> dict[str, Any]:
     """关键帧 -> i2v 视频.
 
-    Phase 3.2: 用 generation/router.py 按 profile 选 backend, 失败 fallback;
-    keyframe_strategy=="first_last" 且 shot.last_keyframe_url 有值时, 传双帧给支持的 backend.
+    Phase 3.2: 用 generation/router.py 按 profile 选 backend.
+    Phase 4.1: 读 shot.retry_seed / retry_force_backend, 传给 router (critic 设置的 retry 提示).
     """
     shot = state["shot"]
     first_frame = state.get("prev_last_frame_url") or shot.keyframe_url
@@ -451,6 +459,10 @@ async def video_node(state: ShotState) -> dict[str, Any]:
 
     # 双帧策略时, 把 last_keyframe_url 传给 router
     last_frame_in = shot.last_keyframe_url if state.get("keyframe_strategy") == "first_last" else None
+
+    # Phase 4.1: 读 critic 上次的 retry 提示
+    seed = shot.retry_seed
+    force_backend = shot.retry_force_backend
 
     if state["is_dry_run"]:
         # dry_run 短路: 不调 router
@@ -460,18 +472,30 @@ async def video_node(state: ShotState) -> dict[str, Any]:
             duration_sec=shot.duration_sec,
             dry_run=True,
         )
+        shot.last_backend_used = "mock"
     else:
-        # 真实路径: 通过 router 选 backend
         from profiles import get_profile
         from generation.router import generate_video
         profile = get_profile(state.get("pipeline_profile_id") or "short_drama")
-        result = await generate_video(
+
+        if shot.retry_count > 0:
+            print(f"[video] retry #{shot.retry_count} shot={shot.shot_id} "
+                  f"seed={seed} force_backend={force_backend}")
+
+        result, backend_used = await generate_video(
             profile=profile,
             prompt=build_video_prompt(shot.prompt),
             first_frame_url=first_frame,
             last_frame_url=last_frame_in,
             duration_sec=shot.duration_sec,
+            seed=seed,
+            force_backend=force_backend,
         )
+        shot.last_backend_used = backend_used
+
+    # 用过 retry 提示就清掉, 防止下次错用
+    shot.retry_seed = None
+    shot.retry_force_backend = None
 
     shot.video_url = result.video_url
     shot.last_frame_url = result.last_frame_url
@@ -479,28 +503,152 @@ async def video_node(state: ShotState) -> dict[str, Any]:
     return {"shot": shot}
 
 
+async def _download_video_for_critic(url: str) -> tuple[str, bool]:
+    """拿到本地路径给 critic 抽帧. 返回 (path, owns_tmp_file).
+    owns_tmp_file=True 时调用方负责清理; False 表示这是用户已有的文件.
+    """
+    if url.startswith("file://"):
+        return url[len("file://"):], False
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=".mp4", prefix="critic_")
+    os.close(fd)
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url, timeout=aiohttp.ClientTimeout(total=300)) as r:
+            r.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                async for chunk in r.content.iter_chunked(1 << 16):
+                    f.write(chunk)
+    return tmp_path, True
+
+
 async def critic_node(state: ShotState) -> dict[str, Any]:
-    """VLM 检查. 二元 pass/fail"""
+    """Phase 4.1: 真实 identity 评分驱动 retry.
+
+    流程:
+      1. dry_run / 没 video / 没 character embedding → 直 pass
+      2. 下载视频 → InsightFace embedding → cos sim vs character.embedding
+      3. 落库 (data/critic_scores.db) 不论 pass/fail 都记一笔
+      4. 根据 profile.consistency_threshold_identity 和 retry_count 决定:
+         pass / retry_seed / retry_backend / fail
+      5. 通过 shot.retry_seed / retry_force_backend 把决策传给下次 video_node
+    """
     shot = state["shot"]
-    chars = [state["char_sheets"][c] for c in shot.character_ids]
-    passed, notes, cost = await _vlm_critic_check(
-        shot.keyframe_url, shot.video_url, chars, dry_run=state["is_dry_run"],
+
+    # dry_run: mock pass
+    if state["is_dry_run"]:
+        shot.status = "done"
+        shot.critic_notes = "ok (dry-run)"
+        return {"shot": shot}
+
+    # 没视频: 直接 fail (video_node 出错了)
+    if not shot.video_url:
+        shot.status = "failed"
+        shot.critic_notes = "no video_url (upstream failure)"
+        return {"shot": shot}
+
+    # 找 character embedding
+    from assets import store as asset_store
+    char_emb = None
+    char_id_for_log = None
+    for cid in shot.character_ids:
+        card = asset_store.get_character(cid)
+        if card and card.embedding:
+            char_emb = card.embedding
+            char_id_for_log = cid
+            break
+
+    if char_emb is None:
+        # 没参考: 跳过 identity 检查 (后续 Phase 4.2 加 scene/narrative 维度可填补)
+        shot.status = "done"
+        shot.critic_notes = "skipped (no character embedding in asset store)"
+        return {"shot": shot}
+
+    # 下载视频 + 抽帧 + ArcFace score
+    from critic.identity import score_shot_identity
+    from critic import store as critic_store
+    from critic.policy import decide_next
+    from profiles import get_profile
+
+    tmp_path, owns_tmp = await _download_video_for_critic(shot.video_url)
+    try:
+        score_result = score_shot_identity(tmp_path, char_emb)
+    finally:
+        if owns_tmp:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+
+    score = score_result["score"]
+    profile = get_profile(state.get("pipeline_profile_id") or "short_drama")
+    threshold = profile.consistency_threshold_identity
+    passed = (score is not None) and (score >= threshold)
+
+    # 落库 (无论 pass/fail)
+    critic_store.record_score(
+        thread_id=state.get("pipeline_thread_id") or "ad-hoc",
+        shot_id=shot.shot_id,
+        dimension="identity",
+        score=score,
+        threshold=threshold,
+        passed=passed,
+        backend=shot.last_backend_used,
+        retry_count=shot.retry_count,
+        video_url=shot.video_url,
+        detail={
+            "char_id": char_id_for_log,
+            "frame_time_sec": score_result.get("frame_time_sec"),
+            "reason": score_result.get("reason"),
+        },
     )
-    shot.cost_usd += cost
-    shot.critic_notes = notes
-    shot.status = "done" if passed else "failed"
+
+    # 决策
+    decision = decide_next(
+        score=score,
+        threshold=threshold,
+        retry_count=shot.retry_count,
+        profile_escalation=profile.escalation_policy,
+        profile_retry_budget=profile.retry_budget,
+        profile_video_backend_fallback=profile.video_backend_fallback,
+    )
+    shot.critic_notes = (
+        f"identity={score if score is None else f'{score:.3f}'} "
+        f"thr={threshold:.2f} → {decision.action}: {decision.reason}"
+    )
+    print(f"[critic] shot={shot.shot_id} retry={shot.retry_count} {shot.critic_notes}")
+
+    if decision.action == "pass":
+        shot.status = "done"
+    elif decision.action == "retry_seed":
+        shot.status = "failed"
+        shot.retry_seed = decision.next_seed
+    elif decision.action == "retry_backend":
+        shot.status = "failed"
+        shot.retry_force_backend = decision.next_backend
+    else:  # "fail"
+        shot.status = "failed"
+        # 不设 retry 提示 → critic_router 看到 failed + 无提示, finalize 收尾
+
     return {"shot": shot}
 
 
 def critic_router(state: ShotState) -> Literal["video_node", "finalize_shot"]:
-    """失败且未超过 retry 上限 -> 重生成视频; 否则结束"""
+    """Phase 4.1: 按 critic 决策路由.
+
+    critic_node 已经设好 shot.status + (retry_seed 或 retry_force_backend).
+      status=done                    → finalize
+      status=failed + 有 retry 提示  → video_node (retry_count++, 清 video_url)
+      status=failed + 无 retry 提示  → finalize (mark failed, budget 用尽 or human gate)
+    """
     shot = state["shot"]
-    MAX_RETRIES = 2
-    if shot.status == "failed" and shot.retry_count < MAX_RETRIES:
+    if shot.status == "done":
+        return "finalize_shot"
+
+    has_hint = shot.retry_seed is not None or shot.retry_force_backend is not None
+    if has_hint:
         shot.retry_count += 1
-        shot.video_url = None
+        shot.video_url = None  # 重生成
         return "video_node"
-    return "finalize_shot"
+
+    return "finalize_shot"  # failed, 无 retry 提示, 收尾
 
 
 async def finalize_shot_node(state: ShotState) -> dict[str, Any]:
@@ -649,6 +797,7 @@ async def run_pipeline(
             "user_prompt": user_prompt,
             "target_duration_sec": target_duration_sec,
             "profile_id": profile_id,
+            "thread_id": thread_id,  # Phase 4.1: critic DB 落库用
             "global_style": "",
             "character_sheets": {},
             "shot_list": [],
