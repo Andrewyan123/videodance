@@ -35,7 +35,9 @@ SCHEMA_GUIDE = """\
         "angle": "<eye_level|low|high|dutch|overhead|worms_eye>",
         "movement": "<static|dolly_in|dolly_out|pan_left|pan_right|tilt_up|tilt_down|tracking|handheld|crane_up|crane_down>"
       },
-      "action": "<这个 shot 里角色的动作描述, 一句话>",
+      "action": "<这个 shot 里角色的核心动作, 一句话>",
+      "action_start": "<动作起点的画面描述 (空间/姿态), 见下面规则>",
+      "action_end":   "<动作终点的画面描述 (空间/姿态), 见下面规则>",
       "emotion": "<情绪标签, e.g. tense, joyful, calm>",
       "dialogue": null,
       "narration": null
@@ -49,6 +51,13 @@ SCHEMA_GUIDE = """\
 - character_ids 里的 id 必须出现在 characters 数组里
 - shot.index 从 0 开始连续递增
 - 至少 1 个 shot
+
+action_start / action_end 规则(**重要, 关键帧 i2i 用**):
+- 必填. 描述这个 shot 在视频"开头第 0 秒"和"结尾最后一秒"这两个时刻的画面.
+- 必须是**自包含的画面 / 姿态描述**, 不引用 action 字段, 不写"开始时"/"结束时"等模糊词.
+- 对**运动型 shot** (走动 / 转身 / 拿起 / 离开), 两端态必须**空间或姿态显著不同**.
+- 对**静态 shot** (坐着思考 / 注视一物), 两端可以接近, 但仍要细微差(头微抬 / 视线移动等).
+- 不要重复 action 字段的内容, 而是把 action 拆成两个时刻.
 """
 
 
@@ -68,12 +77,28 @@ FEWSHOT_EXAMPLE = """\
       "character_ids": ["char_yan"], "props": [],
       "shot_type": "medium_close_up",
       "camera": {"angle": "eye_level", "movement": "static"},
-      "action": "Yan sits at his desk, opens a book", "emotion": "calm",
+      "action": "Yan sits at his desk, picks up a book and opens it",
+      "action_start": "Yan sitting at desk, hands resting on closed leather notebook",
+      "action_end": "Yan looking down at open notebook, fingers tracing a line on the page",
+      "emotion": "calm",
+      "dialogue": null, "narration": null
+    },
+    {
+      "shot_id": "S01-002", "index": 1, "duration_sec": 5.0,
+      "character_ids": ["char_yan"], "props": [],
+      "shot_type": "medium",
+      "camera": {"angle": "low", "movement": "dolly_in"},
+      "action": "Yan stands up and walks toward the window, hand reaching out to the glass",
+      "action_start": "Yan standing beside his chair, body angled toward the window across the room",
+      "action_end": "Yan close to the window, palm pressed against the glass, head slightly tilted",
+      "emotion": "contemplative",
       "dialogue": null, "narration": null
     }
   ]
 }
 ```
+
+注意第二个 shot 的两端态: 起点是"远离窗户站着", 终点是"贴着玻璃", 这是**显著的空间位移**, 利于 i2v 模型做插值.
 """
 
 
