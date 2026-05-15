@@ -67,16 +67,34 @@ class CharacterSheet:
 
 @dataclass
 class Shot:
-    """单个镜头的完整描述"""
+    """单个镜头的完整描述.
+
+    Phase 3.1 加了富字段(shot_type / camera_angle / camera_movement / emotion / scene_ref /
+    dialogue_speaker / dialogue_text)和 action_start/end + last_keyframe_url.
+    向后兼容: 旧 `prompt` 仍 = action, 旧 `camera` 仍 = 拼好的字符串.
+    """
     shot_id: str
     index: int
     prompt: str
     duration_sec: float
     character_ids: list[str]
     camera: str
-    keyframe_url: str | None = None
+    # === 生成产物 ===
+    keyframe_url: str | None = None             # 单帧策略 / first_last 的首帧
+    last_keyframe_url: str | None = None        # Phase 3.1: first_last 的尾帧
     video_url: str | None = None
-    last_frame_url: str | None = None
+    last_frame_url: str | None = None           # i2v 输出的末帧 (链式 first→last)
+    # === Phase 3.1 富字段 (来自 ShotV1) ===
+    shot_type: str = "medium"
+    camera_angle: str = "eye_level"
+    camera_movement: str = "static"
+    emotion: str = "neutral"
+    scene_ref: str | None = None
+    action_start: str | None = None
+    action_end: str | None = None
+    dialogue_speaker: str | None = None
+    dialogue_text: str | None = None
+    # === 状态 ===
     status: Literal["pending", "generating", "done", "failed"] = "pending"
     retry_count: int = 0
     cost_usd: float = 0.0
@@ -109,6 +127,7 @@ class ShotState(TypedDict):
     style: str
     prev_last_frame_url: str | None
     is_dry_run: bool
+    keyframe_strategy: str  # Phase 3.1: "single" | "first_last" | "n_grid"
 
 
 # =============================================================================
@@ -222,11 +241,20 @@ async def plan_node(state: PipelineState) -> dict[str, Any]:
     shots = [
         Shot(
             shot_id=s.shot_id, index=s.index,
-            prompt=s.action,  # ShotV1.action -> Shot.prompt
+            prompt=s.action,  # ShotV1.action -> Shot.prompt (向后兼容)
             duration_sec=s.duration_sec,
             character_ids=s.character_ids,
-            # 把 shot_type + camera 拼成字符串塞 Shot.camera (旧接口)
-            camera=f"{s.shot_type}, {s.camera.as_string()}",
+            camera=f"{s.shot_type}, {s.camera.as_string()}",  # 拼字符串(向后兼容)
+            # Phase 3.1: 完整富字段
+            shot_type=s.shot_type,
+            camera_angle=s.camera.angle,
+            camera_movement=s.camera.movement,
+            emotion=s.emotion,
+            scene_ref=s.scene_ref,
+            action_start=s.action_start,
+            action_end=s.action_end,
+            dialogue_speaker=s.dialogue.speaker if s.dialogue else None,
+            dialogue_text=s.dialogue.text if s.dialogue else None,
         )
         for s in sb.shots
     ]
@@ -285,6 +313,9 @@ def fanout_shots(state: PipelineState) -> list[Send]:
     """用 Send API 并行启动所有 shot subgraph.
     第一版并行生成所有 shots, 用 character_sheets 做一致性. 严格 last->first 链需改 sequential.
     """
+    from profiles import get_profile
+    profile = get_profile(state.get("profile_id") or "short_drama")
+
     sends = []
     sorted_shots = sorted(state["shot_list"], key=lambda s: s.index)
     for shot in sorted_shots:
@@ -294,6 +325,7 @@ def fanout_shots(state: PipelineState) -> list[Send]:
             "style": state["global_style"],
             "prev_last_frame_url": None,
             "is_dry_run": state["dry_run"],
+            "keyframe_strategy": profile.keyframe_strategy,
         }))
     return sends
 
@@ -303,17 +335,22 @@ def fanout_shots(state: PipelineState) -> list[Send]:
 async def keyframe_node(state: ShotState) -> dict[str, Any]:
     """根据 shot prompt + char refs + global style 生成关键帧.
 
-    Phase 1.3 范式切换: 角色有本地 anchor (file:// + 文件存在) → 走 i2i
-    (IMAGE_EDIT_PROVIDER), 用 anchor + scene instruction 派生 keyframe, 这是
-    保持人脸一致性的关键. 没 anchor (cache miss / dry_run) 回退 t2i.
-
-    Anchor 选取规则: shot.character_ids 第一个角色的 ref_image_urls 第一张
-    本地 file://. 多角色场景下次再细化 (group reference / Midjourney Omni Ref).
+    Phase 1.3 i2i 范式: 有 local anchor → IMAGE_EDIT_PROVIDER + instruction;
+    没 anchor → t2i 回退.
+    Phase 3.1: profile.keyframe_strategy 决定单帧 vs 首尾双帧:
+      - "single":      1 帧 → shot.keyframe_url
+      - "first_last":  2 帧 → shot.keyframe_url (first) + shot.last_keyframe_url (last),
+                       两端态用 LLM 给的 shot.action_start / action_end 拼;
+                       缺 LLM 字段时规则法 fallback.
+    富字段 (shot_type / camera_angle / camera_movement / emotion) 都进 i2i instruction.
     """
     import os
-    shot = state["shot"]
+    from generation.keyframe_prompt import build_keyframe_instruction, build_first_last_pair
 
-    # 找第一个能用的本地 anchor
+    shot = state["shot"]
+    strategy = state.get("keyframe_strategy") or "single"
+
+    # 找第一个能用的本地 anchor (Phase 1.3 行为不变)
     anchor_path = None
     for cid in shot.character_ids:
         for url in state["char_sheets"][cid].ref_image_urls:
@@ -325,26 +362,75 @@ async def keyframe_node(state: ShotState) -> dict[str, Any]:
         if anchor_path:
             break
 
-    instruction = build_keyframe_prompt(state["style"], shot.camera, shot.prompt)
+    # 拼 instruction 时优先用富字段 (Phase 3.1); 没有就 fallback 到 shot.camera 字符串
+    use_rich = bool(shot.shot_type and shot.camera_angle)
 
-    if anchor_path and not state["is_dry_run"]:
-        # i2i 范式 (推荐): anchor 锚定人脸 + instruction 换场景
-        print(f"[keyframe] i2i mode shot={shot.shot_id} anchor={os.path.basename(anchor_path)}")
-        result_edit = await _gen_image_edit(
-            anchor_path, instruction, dry_run=state["is_dry_run"],
-        )
-        shot.keyframe_url = result_edit.url
-        shot.cost_usd += result_edit.cost_usd
-    else:
-        # t2i 回退 (cache miss / dry_run): 没 anchor 时的原行为
-        if not state["is_dry_run"]:
-            print(f"[keyframe] t2i fallback shot={shot.shot_id} (no local anchor)")
-        refs = []
-        for cid in shot.character_ids:
-            refs.extend(state["char_sheets"][cid].ref_image_urls)
-        result = await _gen_image(instruction, dry_run=state["is_dry_run"], ref_images=refs)
-        shot.keyframe_url = result.url
-        shot.cost_usd += result.cost_usd
+    if strategy == "first_last":
+        if use_rich:
+            first_instr, last_instr = build_first_last_pair(
+                global_style=state["style"],
+                shot_type=shot.shot_type,
+                camera_angle=shot.camera_angle,
+                camera_movement=shot.camera_movement,
+                action=shot.prompt,
+                action_start=shot.action_start,
+                action_end=shot.action_end,
+                emotion=shot.emotion,
+                scene_ref=shot.scene_ref,
+            )
+        else:
+            # legacy path (无富字段): 退到老 build_keyframe_prompt + 规则法 hint
+            base = build_keyframe_prompt(state["style"], shot.camera, shot.prompt)
+            first_instr = base + ", frozen at the BEGINNING moment, initial body pose"
+            last_instr = base + ", frozen at the ENDING moment, final body pose"
+
+        if anchor_path and not state["is_dry_run"]:
+            print(f"[keyframe] first_last i2i shot={shot.shot_id} anchor={os.path.basename(anchor_path)}")
+            r1 = await _gen_image_edit(anchor_path, first_instr, dry_run=state["is_dry_run"])
+            r2 = await _gen_image_edit(anchor_path, last_instr, dry_run=state["is_dry_run"])
+            shot.keyframe_url = r1.url
+            shot.last_keyframe_url = r2.url
+            shot.cost_usd += r1.cost_usd + r2.cost_usd
+        else:
+            if not state["is_dry_run"]:
+                print(f"[keyframe] first_last t2i fallback shot={shot.shot_id}")
+            refs = []
+            for cid in shot.character_ids:
+                refs.extend(state["char_sheets"][cid].ref_image_urls)
+            r1 = await _gen_image(first_instr, dry_run=state["is_dry_run"], ref_images=refs)
+            r2 = await _gen_image(last_instr, dry_run=state["is_dry_run"], ref_images=refs)
+            shot.keyframe_url = r1.url
+            shot.last_keyframe_url = r2.url
+            shot.cost_usd += r1.cost_usd + r2.cost_usd
+
+    else:  # "single" or unknown → single
+        if use_rich:
+            instruction = build_keyframe_instruction(
+                global_style=state["style"],
+                shot_type=shot.shot_type,
+                camera_angle=shot.camera_angle,
+                camera_movement=shot.camera_movement,
+                action=shot.prompt,
+                emotion=shot.emotion,
+                scene_ref=shot.scene_ref,
+            )
+        else:
+            instruction = build_keyframe_prompt(state["style"], shot.camera, shot.prompt)
+
+        if anchor_path and not state["is_dry_run"]:
+            print(f"[keyframe] single i2i shot={shot.shot_id} anchor={os.path.basename(anchor_path)}")
+            result_edit = await _gen_image_edit(anchor_path, instruction, dry_run=state["is_dry_run"])
+            shot.keyframe_url = result_edit.url
+            shot.cost_usd += result_edit.cost_usd
+        else:
+            if not state["is_dry_run"]:
+                print(f"[keyframe] single t2i fallback shot={shot.shot_id}")
+            refs = []
+            for cid in shot.character_ids:
+                refs.extend(state["char_sheets"][cid].ref_image_urls)
+            result = await _gen_image(instruction, dry_run=state["is_dry_run"], ref_images=refs)
+            shot.keyframe_url = result.url
+            shot.cost_usd += result.cost_usd
 
     shot.status = "generating"
     return {"shot": shot}

@@ -101,6 +101,11 @@ class ShotV1(BaseModel):
     action: str = ""
     emotion: str = "neutral"
 
+    # Phase 3.1: 动作拆分(LLM 输出, 首尾帧 i2i 用)
+    # 为运动型 shot 提供两端态(空间不同), 静态 shot 可 None / 与 action 近似
+    action_start: Optional[str] = None
+    action_end: Optional[str] = None
+
     # 音频
     dialogue: Optional[DialogueSpec] = None
     narration: Optional[str] = None
