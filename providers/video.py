@@ -45,6 +45,7 @@ class DashScopeI2V:
         first_frame_url: str,
         duration_sec: float,
         last_frame_url: str | None = None,  # 兼容 Protocol, turbo 不消化
+        seed: int | None = None,             # Phase 4.1: retry policy 用
     ) -> VideoResult:
         if last_frame_url:
             log.warning("DashScopeI2V(%s): last_frame_url provided but turbo doesn't "
@@ -54,12 +55,15 @@ class DashScopeI2V:
             self.duration_min,
             min(self.duration_max, int(round(duration_sec))),
         )
+        params: dict = {"duration": duration_int}
+        if seed is not None:
+            params["seed"] = seed
         out = await _dashscope.submit_and_poll(
             "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
             body={
                 "model": self.model,
                 "input": {"prompt": prompt[:800], "img_url": first_frame_url},
-                "parameters": {"duration": duration_int},
+                "parameters": params,
             },
             poll_interval=5.0,
             timeout_sec=self.timeout_sec,
@@ -107,6 +111,7 @@ class WanxI2VPlusClient:
         first_frame_url: str,
         duration_sec: float,  # 模型固定 5s, 接收但忽略 (兼容 Protocol)
         last_frame_url: str | None = None,
+        seed: int | None = None,  # Phase 4.1: retry policy 用
     ) -> VideoResult:
         # last_frame 缺失时, 用 first 当 last (退化成"静止画面"是个不好的视频, 提醒)
         if not last_frame_url:
@@ -115,6 +120,9 @@ class WanxI2VPlusClient:
                         "single-frame extrapolation instead.")
             last_frame_url = first_frame_url
 
+        params: dict = {"resolution": self.resolution}
+        if seed is not None:
+            params["seed"] = seed
         out = await _dashscope.submit_and_poll(
             self.ENDPOINT,
             body={
@@ -124,7 +132,7 @@ class WanxI2VPlusClient:
                     "last_frame_url": last_frame_url,
                     "prompt": prompt[:800],
                 },
-                "parameters": {"resolution": self.resolution},
+                "parameters": params,
             },
             poll_interval=10.0,  # plus 慢, 10s 间隔够
             timeout_sec=self.timeout_sec,
@@ -227,9 +235,12 @@ class SeedDanceClient(_VolcengineArkBase):
         first_frame_url: str,
         duration_sec: float,
         last_frame_url: str | None = None,
+        seed: int | None = None,  # ark API 是否接 seed 待确认 (拿到 AK 后调)
     ) -> VideoResult:
         duration = max(4, min(15, int(round(duration_sec))))
         body = self._build_body(prompt, first_frame_url, last_frame_url, duration)
+        if seed is not None:
+            body["seed"] = seed
         out = await self._submit_and_poll(body)
         return VideoResult(
             video_url=out["video_url"],
@@ -259,9 +270,12 @@ class JiMengClient(_VolcengineArkBase):
         first_frame_url: str,
         duration_sec: float,
         last_frame_url: str | None = None,
+        seed: int | None = None,  # ark API 是否接 seed 待确认 (拿到 AK 后调)
     ) -> VideoResult:
         duration = max(4, min(15, int(round(duration_sec))))
         body = self._build_body(prompt, first_frame_url, last_frame_url, duration)
+        if seed is not None:
+            body["seed"] = seed
         out = await self._submit_and_poll(body)
         return VideoResult(
             video_url=out["video_url"],
