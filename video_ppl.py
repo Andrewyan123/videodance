@@ -452,7 +452,11 @@ async def video_node(state: ShotState) -> dict[str, Any]:
 
     Phase 3.2: 用 generation/router.py 按 profile 选 backend.
     Phase 4.1: 读 shot.retry_seed / retry_force_backend, 传给 router (critic 设置的 retry 提示).
+    Phase 4.2: 用 generation/video_prompt.py 拼富字段 instruction (motion arc / 镜头运动 /
+               情绪 / 对白), 而不是只传 action 一句话.
     """
+    from generation.video_prompt import build_video_instruction
+
     shot = state["shot"]
     first_frame = state.get("prev_last_frame_url") or shot.keyframe_url
     assert first_frame, "need a first frame"
@@ -464,10 +468,23 @@ async def video_node(state: ShotState) -> dict[str, Any]:
     seed = shot.retry_seed
     force_backend = shot.retry_force_backend
 
+    # Phase 4.2: 富字段 instruction (有富字段就用, 否则 fallback 到旧 build_video_prompt)
+    if shot.shot_type:  # Phase 3.1+ Shot 才有这些字段; 老 Shot 没有时用 fallback
+        video_instr = build_video_instruction(
+            action=shot.prompt,
+            action_start=shot.action_start,
+            action_end=shot.action_end,
+            camera_movement=shot.camera_movement,
+            emotion=shot.emotion,
+            dialogue_text=shot.dialogue_text,
+        )
+    else:
+        video_instr = build_video_prompt(shot.prompt)
+
     if state["is_dry_run"]:
         # dry_run 短路: 不调 router
         result = await _gen_video(
-            prompt=build_video_prompt(shot.prompt),
+            prompt=video_instr,
             first_frame_url=first_frame,
             duration_sec=shot.duration_sec,
             dry_run=True,
@@ -484,7 +501,7 @@ async def video_node(state: ShotState) -> dict[str, Any]:
 
         result, backend_used = await generate_video(
             profile=profile,
-            prompt=build_video_prompt(shot.prompt),
+            prompt=video_instr,
             first_frame_url=first_frame,
             last_frame_url=last_frame_in,
             duration_sec=shot.duration_sec,
