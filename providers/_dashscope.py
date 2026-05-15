@@ -16,6 +16,14 @@ log = logging.getLogger("video_pipeline.dashscope")
 _MAX_429_RETRIES = 6
 _MAX_BACKOFF = 30.0
 
+# 网络层 transient (timeout / connection reset / payload error) 也按 429 退避
+_NETWORK_TRANSIENT_EXC: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    aiohttp.ServerTimeoutError,
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+)
+
 
 async def _post_with_429_retry(
     sess: aiohttp.ClientSession,
@@ -25,28 +33,42 @@ async def _post_with_429_retry(
     headers: dict[str, str],
     timeout_sec: float = 60.0,
 ) -> dict[str, Any]:
-    """POST + 429 指数退避. 其他 4xx/5xx 直接 raise."""
+    """POST + 429 指数退避 + 网络层 transient 重试. 其他 4xx/5xx 直接 raise."""
     for attempt in range(_MAX_429_RETRIES + 1):
-        async with sess.post(
-            url, json=json_body, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout_sec),
-        ) as r:
-            text = await r.text()
-            if r.status == 429:
-                if attempt >= _MAX_429_RETRIES:
-                    raise RuntimeError(
-                        f"DashScope 429 after {attempt} retries: {text[:500]}"
+        try:
+            async with sess.post(
+                url, json=json_body, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout_sec),
+            ) as r:
+                text = await r.text()
+                if r.status == 429:
+                    if attempt >= _MAX_429_RETRIES:
+                        raise RuntimeError(
+                            f"DashScope 429 after {attempt} retries: {text[:500]}"
+                        )
+                    wait = min(2 ** attempt + random.random(), _MAX_BACKOFF)
+                    log.warning(
+                        "DashScope 429, attempt %d/%d, sleep %.1fs",
+                        attempt + 1, _MAX_429_RETRIES, wait,
                     )
-                wait = min(2 ** attempt + random.random(), _MAX_BACKOFF)
-                log.warning(
-                    "DashScope 429, attempt %d/%d, sleep %.1fs",
-                    attempt + 1, _MAX_429_RETRIES, wait,
-                )
-                await asyncio.sleep(wait)
-                continue
-            if r.status >= 400:
-                raise RuntimeError(f"DashScope submit HTTP {r.status}: {text[:500]}")
-            return json.loads(text)
+                    await asyncio.sleep(wait)
+                    continue
+                if r.status >= 400:
+                    raise RuntimeError(f"DashScope submit HTTP {r.status}: {text[:500]}")
+                return json.loads(text)
+        except _NETWORK_TRANSIENT_EXC as e:
+            if attempt >= _MAX_429_RETRIES:
+                raise RuntimeError(
+                    f"DashScope network-transient retry exhausted after {attempt} attempts: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
+            wait = min(2 ** attempt + random.random(), _MAX_BACKOFF)
+            log.warning(
+                "DashScope %s (timeout=%.0fs), attempt %d/%d, sleep %.1fs",
+                type(e).__name__, timeout_sec, attempt + 1, _MAX_429_RETRIES, wait,
+            )
+            await asyncio.sleep(wait)
+            continue
     raise AssertionError("unreachable")
 
 
@@ -81,18 +103,28 @@ async def submit_and_poll(
 
         while True:
             await asyncio.sleep(poll_interval)
-            async with sess.get(
-                poll_url, headers=poll_headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as r:
-                text = await r.text()
-                if r.status == 429:
-                    # 轮询命中 429 是上游 burst, 跳过这次轮询继续等下次 tick.
-                    log.warning("DashScope poll 429 for %s, will retry next tick", task_id)
-                    continue
-                if r.status >= 400:
-                    raise RuntimeError(f"DashScope poll HTTP {r.status}: {text[:500]}")
-                tdata = json.loads(text)
+            try:
+                async with sess.get(
+                    poll_url, headers=poll_headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    text = await r.text()
+                    if r.status == 429:
+                        # 轮询命中 429 是上游 burst, 跳过这次轮询继续等下次 tick.
+                        log.warning("DashScope poll 429 for %s, will retry next tick", task_id)
+                        continue
+                    if r.status >= 400:
+                        raise RuntimeError(f"DashScope poll HTTP {r.status}: {text[:500]}")
+                    tdata = json.loads(text)
+            except _NETWORK_TRANSIENT_EXC as e:
+                # 单次 poll 失败不要让整个任务挂掉; 等下次 tick 再问
+                log.warning("DashScope poll %s for %s, will retry next tick: %s",
+                            type(e).__name__, task_id, e)
+                if asyncio.get_event_loop().time() > deadline:
+                    raise TimeoutError(
+                        f"DashScope task {task_id} timeout {timeout_sec}s (last error: {e})"
+                    ) from e
+                continue
 
             out = tdata.get("output", {})
             status = out.get("task_status")
