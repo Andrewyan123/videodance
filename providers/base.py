@@ -74,4 +74,5 @@ class VideoProvider(Protocol):
         prompt: str,
         first_frame_url: str,
         duration_sec: float,
+        last_frame_url: str | None = None,  # Phase 3.2: 首尾帧 i2v 支持
     ) -> VideoResult: ...
