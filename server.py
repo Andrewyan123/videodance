@@ -345,6 +345,34 @@ async def serve_video(path: str = Query(...)):
     return FileResponse(real, media_type="video/mp4")
 
 
+@app.get("/api/asset")
+async def serve_asset(path: str = Query(...)):
+    """Serve a local asset (character ref image / interactive 拼接产物 / 等等).
+
+    白名单允许下面任一根目录:
+      - STITCH_OUT_DIR  (拼接产物)
+      - VIDEO1_DATA_DIR (默认 ./data, asset library + candidates DB + 角色 png)
+    mime 由文件后缀决定 (.png/.jpg/.mp4/.webm).
+    """
+    allowed_roots = [
+        os.path.realpath(os.environ.get("STITCH_OUT_DIR", "/tmp/video1.0_stitch")),
+        os.path.realpath(os.environ.get("VIDEO1_DATA_DIR", "./data")),
+    ]
+    real = os.path.realpath(path)
+    if not any(real.startswith(root + os.sep) or real == root for root in allowed_roots):
+        raise HTTPException(403, f"path outside allowed roots {allowed_roots}")
+    if not os.path.isfile(real):
+        raise HTTPException(404, f"not a file: {real}")
+    # 简单 mime 推断
+    ext = os.path.splitext(real)[1].lower()
+    mime = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".mp4": "video/mp4", ".webm": "video/webm",
+    }.get(ext, "application/octet-stream")
+    return FileResponse(real, media_type=mime)
+
+
 # =============================================================================
 # Interactive endpoints (Phase 5.1)
 # =============================================================================
