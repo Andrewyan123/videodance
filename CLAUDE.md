@@ -1,115 +1,192 @@
-# video1.0 — Video Generation Pipeline
+# video1.0 — AI 长视频生成流水线
 
-LangGraph-based 文生视频流水线: 用户 prompt → 多 shot 并行生成 → ffmpeg 拼接成片。
+LangGraph 编织的 文/分镜 → 多 shot 视频 → 拼接成片 的本地工具链。两种模式:**auto**(一把跑完)和 **interactive**(用户每步参与抽奖+挑选)。
 
-**📋 完整架构、流派 profile、扩展点、分阶段路线图见 [design/architecture.md](design/architecture.md)。本文档只列快速入门要点。**
+**📋 整体架构 / 流派 Profile / 长期路线图 → [design/architecture.md](design/architecture.md)。各 Phase 落地纪要 → `design/phaseN-progress.md`。本文档是给 Claude Code(和人)看的快速入门。**
 
-## Architecture
+## 当前能力(Phase 0 → 5.2 全部已落地)
 
 ```
-Planner -> CharacterSheets -> [Shot Subgraph × N parallel] -> Stitcher
-                                       │
-                                       └── Keyframe -> Video -> Critic -> (retry?)
+Phase 1   Asset Library                — SQLite + 文件系统角色卡 (data/assets.db)
+Phase 1.2 InsightFace ArcFace          — 角色 embedding (512-d)
+Phase 1.3 i2i paradigm                 — 用挑中的 anchor + 指令做 keyframe (不是盲 t2i 召回)
+Phase 2   Storyboard DSL               — strict Pydantic + 3 层 json-repair + profile-aware planner
+Phase 3.1 Rich keyframe fields         — shot_type/camera/emotion/action_start/action_end/dialogue + LLM 切首尾
+Phase 3.2 First-last frame i2v         — wanx2.1-kf2v-plus + multi-backend router
+Phase 4.1 Critic loop                  — identity → policy(retry seed → switch backend → fail),落 data/critic_scores.db
+Phase 4.2 Rich-field i2v prompt        — motion arc + camera + emotion + dialogue 拼进 i2v prompt
+Phase 5.1 Interactive backend          — char/shot variant 抽奖 + 用户 select + 拼接,落 data/candidates.db
+Phase 5.2 Frontend wizard              — 4 步交互 UI:Input → Chars → Shots tree → Stitch + SSE 进度
 ```
 
-- **Planner** (LLM): 用户 prompt → 结构化 `{global_style, characters, shots}` JSON
-- **CharacterSheets** (T2I): 每个角色生成多角度参考图,供后续 shot 复用
-- **Shot Subgraph** (并行 fanout): 每个 shot 独立子图 — keyframe(T2I) → video(I2V) → critic(VLM) → finalize
-- **Stitcher** (ffmpeg): 下载所有 shot 视频, `concat -c copy` 拼接(失败回退 re-encode)
-
-State 用 LangGraph reducers 累积(`shots` 用 dict-merge,`total_cost_usd` 用 `operator.add`),所以并行 shot 写回安全。SQLite checkpointer 支持崩溃续跑。
+```
+Planner -> [CharVariants × N] -> [ShotVariants × K per shot] -> Stitcher
+   LLM      用户挑 anchor             用户挑 video               ffmpeg concat
+            (后续 i2i 用 anchor)        critic 自动评分
+                                       failure → retry(seed/backend)
+```
 
 ## Project Structure
 
 ```
-video_ppl.py        # 图定义 + 节点 (orchestration only, 后续平移到 orchestration/)
-server.py           # FastAPI: POST /api/runs + SSE /api/runs/{tid}/events + 静态前端
-frontend/           # 单页 vanilla HTML/CSS/JS, 不需 build step
-  index.html        # 表单 + 进度条 + 视频播放
-  app.js            # EventSource 消费 SSE, 渲染分阶段进度
-  style.css
+video_ppl.py        # 主图(自动模式):Planner → CharacterSheets → Shots(并行)→ Stitcher
+                    #   Shot 含 retry_seed / retry_force_backend / last_backend_used(Phase 4.1)
+server.py           # FastAPI:auto 模式 SSE + interactive 模式 8 端点 + /api/asset 静态服务
 
-design/             # 设计文档 (source of truth)
-  architecture.md   # 整体架构 / Profile / 路线图
-  full.md           # 行业调研原文
+frontend/           # 单页 vanilla HTML/CSS/JS,不需 build
+  index.html / wizard.{js,css}   # 默认入口:4 步 wizard(creative mode)
+  auto.html  / auto.{js,css}     # 老 auto 模式,/auto.html 单独访问
 
-profiles/           # 流派 Profile: short_drama / anime / cinema / commercial
-  base.py           # Profile dataclass
-  short_drama.py / anime.py / cinema.py / commercial.py
-  registry.py       # get_profile(id) → Profile
+design/             # 设计文档(source of truth)
+  architecture.md
+  phase{1, 1.2, 1.3, 2, 3.1, 3.2, 4.1, 5.1, 5.2}-progress.md   # 各阶段落地纪要
 
-# === 以下为 Phase 1-6 模块骨架 (当前仅 __init__.py + README, 未实装) ===
-assets/             # Phase 1: 角色 / 场景 / 产品资产库 (SQLite + 文件系统)
-storyboard/         # Phase 2: shot DSL Pydantic schema + planner
-critic/             # Phase 4: 多维度评分 + 重试升级
-audio/              # Phase 5: TTS + Wan2.2-Animate 口型同步
-post/               # Phase 6: ffmpeg / RIFE / 字幕 / overlay
-orchestration/      # video_ppl.py 后续平移到这里
+profiles/           # 流派 Profile:short_drama / anime / cinema / commercial
+  base.py registry.py *.py
 
-providers/          # 模型 backends, 一类 vendor 一个类
-  base.py           # Protocol + Result dataclass (LLM/Image/Video)
-  _dashscope.py     # 共享 async submit-and-poll
-  llm.py            # AnthropicCompatClient, OpenAICompatClient
-  image.py          # DashScopeT2I, OpenAIImageClient(stub for gpt-image-2)
-  video.py          # DashScopeI2V (已接), SeedDanceClient + JiMengClient (stub, 等 VOLC AK)
-  __init__.py       # build_*_provider() 工厂, 读 env 选实现
-prompts/            # 提示词模板
-  planner.py        # PLANNER_SYSTEM + build_planner_user()
-  critic.py         # CRITIC_RUBRIC
-  shots.py          # build_keyframe/video/character_ref_prompt + CHARACTER_ANGLES
+assets/             # Phase 1.x:角色资产库
+  schema.py store.py builder.py faceid.py cli.py  README.md
+  # CharacterCard(SQLite data/assets.db)+ 三视图 PNG + ArcFace 512-d embedding
+
+storyboard/         # Phase 2:分镜 DSL
+  schema.py prompts.py repair.py validator.py planner.py cli.py  README.md
+  # Pydantic strict + 3 层 fallback(json-repair → few-shot retry → fail)
+
+generation/         # Phase 3:keyframe / video 执行 + 选 backend
+  keyframe_prompt.py video_prompt.py router.py
+  # build_first_last_pair() / build_video_instruction()
+  # router.generate_video(profile, shot, seed?, force_backend?) → (Result, factory_name)
+
+critic/             # Phase 4:多维评审 + 重试决策
+  identity.py policy.py store.py  README.md
+  # score_shot_identity(ffmpeg 抽帧 → InsightFace → cos sim vs anchor)
+  # decide_next(score, threshold, retry_count, profile) → pass | retry_seed | retry_backend | fail
+  # 评分一律落 data/critic_scores.db(后续 RL reward 用)
+
+candidates/         # Phase 5.1:interactive 模式数据层
+  schema.py store.py builder.py acceptance_test.py
+  # 3 表 SQLite(data/candidates.db):sessions / character_candidates / shot_candidates
+  # propose_character_variants() / propose_shot_variants() / promote_character_to_canonical()
+
+providers/          # 模型 backend,每类一组 Protocol + 具体类
+  base.py _dashscope.py
+  llm.py        # AnthropicCompatClient(走 dashscope compat-mode),OpenAICompatClient
+  image.py      # DashScopeT2I(wanx2.1-t2i-turbo)
+  image_edit.py # WanxI2IClient(wanx2.1-imageedit, i2i 通道)
+  video.py      # DashScopeI2V(turbo), WanxI2VPlusClient(kf2v-plus), SeedDance/JiMeng(stub)
+
+prompts/            # 老的集中 prompt(planner / critic / shots)
+                    # Phase 2 起,新模块自带 prompts(storyboard/generation/critic)
+
+audio/  post/  orchestration/   # Phase 6 留位,仅 __init__.py,未实装
+
+data/               # 运行产物(.gitignored)
+  assets.db / assets/<char_id>/         # 角色卡 + 三视图
+  critic_scores.db                       # 每次评分(thread_id × shot_id × dimension)
+  candidates.db                          # interactive sessions / variants / selections
+video_pipeline.db   # LangGraph checkpoint(老,位置在项目根)
 ```
 
-**节点代码不直接调任何 vendor SDK** — 只调 `LLM_PROVIDER.ainvoke()` / `IMAGE_PROVIDER.generate()` / `VIDEO_PROVIDER.generate()`。换 vendor 改 env 即可,加 vendor 在 providers 包里加新类 + 在工厂多一个分支。
+**节点代码不直接调任何 vendor SDK** —— 只调 `LLM_PROVIDER.ainvoke()` / `IMAGE_PROVIDER.generate()` / `IMAGE_EDIT_PROVIDER.edit()` / `VIDEO_PROVIDER.generate()`。换 vendor 改 env,加 vendor 在 providers 包加新类 + 工厂多一个分支。
+
+## 两种运行模式
+
+### Auto(一把跑完)
+
+```
+POST /api/runs  { mode: "auto" (默认), prompt, duration_sec, profile, dry_run }
+  → 后端跑 video_ppl.run_pipeline(...)
+  → SSE 推 started / plan_done / character_sheets_done / shot_progress / stitch_done / completed
+  → 成片落 STITCH_OUT_DIR
+```
+
+UI:`/auto.html`。
+
+### Interactive(用户参与抽奖)
+
+| Endpoint | 行为 |
+|---|---|
+| `POST /api/runs  {mode:"interactive"}` | 只跑 planner,返 thread_id + storyboard,入 sessions 表 |
+| `GET  /api/runs/{tid}/storyboard` | 拿 storyboard JSON |
+| `POST /api/runs/{tid}/characters/{cid}/propose?n=4` | 抽 N 张候选(t2i) |
+| `POST /api/runs/{tid}/characters/{cid}/select?variant=K` | 选定 + promote 到 assets/store |
+| `POST /api/runs/{tid}/shots/{sid}/propose?n=3` | 抽 K 段候选(i2i + i2v + critic) |
+| `POST /api/runs/{tid}/shots/{sid}/select?variant=K` | 选定 |
+| `GET  /api/runs/{tid}/tree` | 整棵树 + selection 状态 |
+| `POST /api/runs/{tid}/stitch` | 拉 selected 视频 → ffmpeg concat → 成片 |
+
+`GET /api/runs/{tid}/events` SSE 流:propose_*_start / progress / done_variant / complete / error。
+
+UI:`/`(默认,4 步 wizard)。
 
 ## 关键设计决策
 
-- **Provider 抽象**: 每类(LLM/Image/Video)定义 Protocol + Result dataclass。具体类不继承 ABC,鸭子类型够用。Provider 在 `video_ppl.py` import 时构造一次(单例),env-driven。
-- **Prompts 集中**: 所有 prompt 字符串和模板生成函数都在 `prompts/`,不散落在节点逻辑里。换 prompt 不改图。
-- **dry_run 在 wrapper 而非 provider**: `_gen_image` / `_gen_video` 在节点侧检查 `dry_run` 返回 mock,真实 provider 类干净不沾 mock 逻辑。
-- **VLM critic 暂未抽 provider**: 当前 `_vlm_critic_check` 直 pass。要接 Qwen-VL/Claude Vision 时再加 `VLMProvider` Protocol + `providers/vlm.py`。
-- **ShotState 键名 vs PipelineState 故意错开** (`char_sheets` vs `character_sheets`, `style` vs `global_style`, `is_dry_run` vs `dry_run`): LangGraph 子图退出时同名键会回写父级,并行 fanout 写非 `Annotated` 父键会触发 `InvalidUpdateError`。
+- **Provider 抽象**:每类(LLM/Image/ImageEdit/Video)定义 Protocol + Result dataclass。鸭子类型,不继承 ABC。Provider 在 `providers/__init__.py` import 时构造一次(单例),env-driven。
+- **i2i 而非 t2i 召回(Phase 1.3 关键决策)**:角色 keyframe 用 `anchor.png + 指令文本` 走 wanx-imageedit,**不**重新 t2i 召回。原因:wanx-t2i-turbo 不吃 ref_images,纯 t2i 召回 identity 只有 0.146,切 i2i 后 0.426(2.9×)。
+- **Prompts 集中或就近,二选一**:老 `prompts/` 集中放 planner/critic/shots;新模块(storyboard/generation/critic)各自自带 prompt 文件。换 prompt 不改图。
+- **dry_run 在 wrapper 而非 provider**:节点侧检查 `dry_run` 返回 mock,provider 类干净不沾 mock。
+- **ShotState 键名 vs PipelineState 故意错开**(`char_sheets` vs `character_sheets`, `style` vs `global_style`, `is_dry_run` vs `dry_run`, `pipeline_thread_id` 透传 thread_id):LangGraph 子图退出时同名键会回写父级,并行 fanout 写非 `Annotated` 父键会触发 `InvalidUpdateError`。
+- **storyboard 落 JSON 字符串到 sessions 表**:schema 演进零代价。同款做法 `assets.store.payload` 也用了。
+- **character variants 用 `__v0/__v1` 后缀走 asset_builder**:每个 variant 独立目录(`data/assets/char_yan__v0/`),用户 select 后 `promote_character_to_canonical` 把数据写到 canonical `char_yan`,下游 i2i 无感知。
+- **critic 评分一律落库**(无论 pass/fail):`data/critic_scores.db` 是后续 RL 的天然 reward signal。表 `dimension` 字段为多维度准备,目前只有 `identity`。
 
-## Gotchas (踩过的坑)
+## Gotchas(踩过的坑)
 
-- **eval.dashscope.aliyuncs.com/apps/anthropic-native 返回 403 RBAC**: 二组 key (`sk-a624...`) 没权限。改走 `dashscope.aliyuncs.com/compatible-mode/v1`,路径是 `/chat/completions` 但 Claude 模型响应是 Anthropic 原生 schema。这就是 `AnthropicCompatClient` 的设计起点。
-- **shell 里有 SOCKS 代理变量(`all_proxy=socks5://...`) 会让 anthropic SDK 报 `socksio not installed`**: 跑前先 `unset all_proxy http_proxy https_proxy`,或装 `httpx[socks]`。
-- **LangGraph `stream_mode="updates"` 子图节点的 update 是 `None`**: 不能直接 `update.keys()`,要 `isinstance(update, dict)` 守卫。
-- **wanx2.1-i2v-turbo duration 当前只接受 [3, 5]**: 自动 clamp。要更长换 `wanx2.1-i2v-plus`(支持到 10s)。
-- **wanx2.1-i2v-turbo 不返回末帧**: `last_frame_url=None`,链式条件 `prev_last_frame_url` 暂不可用,fanout 也都传 None。
-- **wanx2.1-t2i-turbo 不吃 ref images**: 纯 t2i,角色一致性靠 prompt 复述。要参考图条件生成换 `wanx2.1-i2i` / `qwen-image-edit`,API 路径不同,要加新 provider 类。
-- **planner LLM 会把 JSON 套 ```json ... ```** : `plan_node` 里有 fence 剥离逻辑。
-- **macOS TCC 偶尔会拦截 Claude Code 进程访问 `~/Documents`**: 报 `Operation not permitted`。需要在系统设置→隐私与安全性→文件与文件夹给 Terminal 授权,然后 Cmd+Q 重启 Terminal。
+- **eval.dashscope.aliyuncs.com/apps/anthropic-native 403 RBAC**:eval 二组 key 没权限。走 `dashscope.aliyuncs.com/compatible-mode/v1` —— 路径是 `/chat/completions` 但 Claude 模型响应是 Anthropic 原生 schema。这就是 `AnthropicCompatClient` 的设计起点。
+- **SOCKS 代理破 anthropic SDK**:shell 里有 `all_proxy=socks5://...` 会让 anthropic 报 `socksio not installed`。跑前 `unset all_proxy http_proxy https_proxy`(或装 `httpx[socks]`)。
+- **LangGraph `stream_mode="updates"` 子图节点 update=None**:不能直接 `update.keys()`,要 `isinstance(update, dict)` 守卫。
+- **wanx2.1-i2v-turbo duration 只接受 [3, 5]**:自动 clamp。更长用 `wanx2.1-i2v-plus`(到 10s)。
+- **wanx2.1-i2v-turbo 不返回末帧**:`last_frame_url=None`,链式 last → first 暂不可用,fanout 都传 None。
+- **wanx2.1-t2i-turbo 不吃 ref_images**:Phase 1.3 切 i2i 的根本原因。要图条件生成走 `wanx2.1-imageedit` / `qwen-image-edit`。
+- **wanx-imageedit 要 data URI**:`file://` URI 报 "Incorrect padding",必须 base64 data URI。
+- **wanx-kf2v-plus 真实模型名**:8 个变体探测后是 `wanx2.1-kf2v-plus`(不是 `wan2.1-kf2v-plus`)。
+- **planner LLM 会把 JSON 套 ```json ... ```**:`plan_node` 和 `storyboard/repair.py` 都有 fence 剥离。
+- **wanx-i2v-plus first-last 反而比 turbo 单帧 identity 低**(0.368 vs 0.426,强运动 shot):双帧插值 pose drift。Phase 4.1 critic loop 就是为此 retry。
+- **macOS TCC 拦 ~/Documents**:`Operation not permitted` → 系统设置→隐私与安全性→文件与文件夹给 Terminal 授权 → Cmd+Q 重启 Terminal。
+- **macOS /tmp 自动清理**:跨日的 acceptance 产物会消失,别指望长久。
+- **DashScope 429 / 418 wrapped 429**:`providers/_dashscope.py` 有指数退避 + jitter 重试,timeout / connection error 同样。
 
 ## 运行
 
-Key 和 provider 选择都从项目根的 `.env` 加载(`providers/__init__.py` 在工厂构造前 `load_dotenv()`)。模板见 `.env.example`,实际值放 `.env`(已 gitignored)。Shell env 优先级高于 .env(`override=False`),CI / 命令行临时覆盖照常工作。
+Key 和 provider 选择都从项目根 `.env` 加载(`providers/__init__.py` 在工厂前 `load_dotenv()`)。模板见 `.env.example`,实际值放 `.env`(已 gitignored)。Shell env 优先于 .env(`override=False`)。
 
 ```bash
-cp .env.example .env   # 首次, 填入实际 key
-unset all_proxy http_proxy https_proxy   # 见 gotchas
-uv run python video_ppl.py               # __main__ 默认 dry_run=True
-```
-
-真实跑:在 `__main__` 改 `dry_run=False`,或调 `run_pipeline(..., dry_run=False)`。
-
-`.env` 必填:`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`(指向 dashscope compat-mode)、`DASHSCOPE_API_KEY`。可选项见 `.env.example` 注释行。
-
-### Web UI
-
-```bash
+cp .env.example .env                       # 首次,填 key
+unset all_proxy http_proxy https_proxy     # 见 gotchas
 uv run uvicorn server:app --host 127.0.0.1 --port 8000
-# 浏览器打开 http://127.0.0.1:8000
+
+# 浏览器:
+#   http://127.0.0.1:8000/         → wizard 交互模式
+#   http://127.0.0.1:8000/auto.html → 老 auto 模式
 ```
 
-- `POST /api/runs` 启动一次 pipeline,返回 `{thread_id}`
-- `GET /api/runs/{tid}/events` SSE 流,每条 `data: {...}` 事件:`started` / `plan_done` / `character_sheets_done` / `shot_progress` / `stitch_done` / `completed` / `error` / `done`
-- `GET /api/video?path=/tmp/...` 服务本地 stitch 产物(白名单限制在 `STITCH_OUT_DIR` 内,防 path traversal)
-- run 状态在内存,**进程重启即丢**;长任务跑到一半重启会孤儿。SQLite checkpoint 还在,但 SSE 流断了不会自动 resume。
+CLI(不走 server):
 
-## 当前未实现 / TODO
+```bash
+uv run python video_ppl.py                   # __main__ 默认 dry_run=True
+uv run python -m assets create ...           # 角色卡 CLI(Phase 1)
+uv run python -m storyboard generate ...     # 分镜 DSL CLI(Phase 2)
+```
 
-- `OpenAIImageClient` (gpt-image-2): stub,接入按 OpenAI Images API
-- `SeedDanceClient`: stub
-- VLM critic: 直 pass,真实质量门控未接
-- Stitch 上传到 OSS: 当前只产 `file:///tmp/...` 本地路径
-- 链式 last-frame → first-frame: provider 当前不返回末帧,严格连续性要换模型 + 改 fanout
+`.env` 必填:`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`(指向 dashscope compat-mode)、`DASHSCOPE_API_KEY`。其他可选项见 `.env.example` 注释。
+
+### 真实跑成本参考(Phase 5.1 acceptance:1 char × 2 variant + 1 shot × 2 variant + stitch)
+
+| 步骤 | 耗时 | 成本 |
+|---|---:|---:|
+| planner | 9 s | <$0.01 |
+| 2 char variants(t2i 三视图) | 59 s | ~$0.12 |
+| 2 shot variants(i2i + wanx-i2v-plus,串行) | 639 s | ~$6 |
+| stitch | 2.5 s | 0 |
+| **总计** | **~12 min** | **~$6** |
+
+## 当前未实装 / TODO
+
+- **真实第三方 backend**:`SeedDanceClient` / `JiMengClient` 已写 stub + API shape,等用户拿到 `ARK_API_KEY` / volcengine AK 即可填实。`OpenAIImageClient`(gpt-image-2)同样 stub。
+- **multi-dim critic**:目前只 identity 一维。scene / narrative / VSA 留 Phase 4.2。
+- **音频 + 口型同步**:`audio/` 仅占位,TTS(CosyVoice)+ Wan2.2-Animate 留 Phase 6。
+- **后期精修**:`post/` 占位,RIFE 转场 / BGM / 字幕烧录留 Phase 6。
+- **stitch 上传到 OSS**:当前只产 `file:///tmp/...` 本地路径,要 share 用 scp / 上传网盘。
+- **session 持久化**:wizard 刷新页面 / 关浏览器后无法 resume(SQLite checkpoint 在,SSE 流断了)。
+- **dry_run 完整链路**:`candidates/builder.py` propose 还没接 dry_run,wizard 4 步不能纯 mock 体验。
+- **失败 variant 单独重抽**:UI 目前红框显示,要点"再抽 N 个"整组重来。
